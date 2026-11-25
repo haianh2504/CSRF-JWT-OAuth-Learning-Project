@@ -1,948 +1,414 @@
-# Testing Use Cases — CSRF_JWT_OAuth Shop
+# Testing Use Cases — JWT OAuth Mock Shop
 
-## 1. Purpose
+## 1. Purpose and baseline assumptions
 
-This document defines manual and automated test scenarios derived from the current `PRD.md`, `README.md`, `use_case.md`, and `api_contract.md`. It covers the user-facing flows, HTTP contract, token handling, mock shop state, and low-probability boundary/error cases.
+This plan derives from `PRD.md`, `README.md`, `use_case.md`, and `api_contract.md`. It is a test specification, not evidence that code has been implemented or run.
 
-These are test specifications, not evidence that the implementation has been built or run. OAuth token delivery uses a short-lived, single-use application handoff code exchanged at `POST /api/v1/auth/oauth/exchange`; popup versus same-tab presentation remains a UI choice.
+- Auth uses signed compact JWS bearer tokens only. A JWT has exactly three Base64URL-encoded segments: `header.payload.signature`; it is not encrypted.
+- Protected endpoints require `Authorization: Bearer <JWT>`.
+- No CSRF token, CSRF header, authentication cookie, or session login is part of this project.
+- Sign-up, sign-in, and OAuth handoff exchange are pre-authentication endpoints and cannot require the app JWT they create.
+- OAuth provider authorization code is exchanged backend-to-provider. Frontend receives only a short-lived, one-time app handoff code, then exchanges it for the app JWT.
+- No database: demo accounts are in memory and reset on backend restart; catalog is fixed mock data; product mutations are acknowledged but not persisted on backend.
+- Frontend stores accepted added products and hidden IDs in `localStorage`; JWT stays in memory only.
+- JSON APIs use `{ "code", "message", "data" }`; OAuth redirects/callbacks are the documented exception.
+- No pagination metadata for the fixed catalog.
 
-## 2. System assumptions under test
+## 2. Test fixtures
 
-- Authentication is JWT-only. There is no session cookie.
-- The backend returns an application JWT after local sign-in. The frontend keeps JWT in memory and sends `Authorization: Bearer <JWT>` to protected endpoints.
-- Authenticated state-changing requests (`POST`, `PUT`, `PATCH`, `DELETE`) require both the JWT header and `X-CSRF-TOKEN`. The backend validates that the CSRF token is associated with the authenticated login context.
-- Sign-up/sign-in and CSRF bootstrap are pre-authentication operations: there cannot be a JWT yet. They use the pre-authentication CSRF token as specified by the API contract.
-- OAuth start/callback routes are browser redirects, not JSON envelope endpoints; OAuth `state` validation is required.
-- The backend has no database. Demo users are in memory and reset on backend restart. Catalog data is fixed mock data. Product writes are acknowledged but not persisted on the server.
-- The frontend persists accepted added products and hidden product IDs in `localStorage`. JWT and CSRF tokens are not persisted there.
-- All JSON API responses use `{ "code", "message", "data" }`. OAuth redirects/callbacks are the documented exception.
-- Catalog is small and fixed; pagination fields are not expected.
+- New account `learner@example.test` with a known test password.
+- Unknown email and second account for negative/cross-account tests.
+- Valid, expired, malformed, wrong-signature, wrong-issuer, wrong-audience, and unsupported-algorithm JWT fixtures.
+- Valid, expired, replayed, malformed, and wrong-provider OAuth handoff codes.
+- Valid product with ID, name, description, finite price, uppercase currency, and nullable image URL.
 
-## 3. Test data and setup
+Use non-production credentials and tokens only. Do not print credentials or tokens in CI logs.
 
-### Demo accounts
+## 3. API envelope and transport tests
 
-- `learner@example.test` with a known test password, created through sign-up.
-- An unregistered email for negative sign-in tests.
-- A second account for cross-account token-binding tests.
+### TC-API-001 — Envelope on success
 
-Use non-production credentials and tokens only. Password storage and verification use Spring Security `BCryptPasswordEncoder`.
+For every JSON success, assert top-level `code`, `message`, `data`; HTTP status is authoritative and consistent. Do not add duplicate `success` or status fields.
 
-### Product examples
+### TC-API-002 — Envelope on errors
 
-Valid product:
+For API errors, assert the same envelope, stable code, useful safe message, and object/null `data` as appropriate.
 
-```json
-{
-  "id": "prd_local_test_001",
-  "name": "Test Mug",
-  "description": "A product created for a test.",
-  "price": 9.5,
-  "currency": "USD",
-  "imageUrl": null
-}
-```
+### TC-API-003 — Content types
 
-Boundary/invalid values include empty and overlong names, negative/NaN/infinite prices, missing currency, malformed image URLs, oversized descriptions, duplicate IDs, Unicode text, and HTML/script-like strings.
+JSON endpoints use `application/json; charset=utf-8`. OAuth route redirects/callbacks are not forced into JSON.
 
-### Credential fixtures
+### TC-API-004 — Status semantics
 
-Prepare valid, expired, malformed, wrong-signature, and revoked JWTs where the implementation supports revocation. Prepare a valid pre-auth CSRF token, valid login-associated CSRF token, expired token, random token, and a token associated with a different JWT/login context.
+Success uses 200 or 201 as specified; do not return 200 for validation/authentication failure or 204 without the required envelope.
 
-## 4. Cross-cutting API contract tests
+### TC-API-005 — No pagination
 
-### TC-API-001 — Success envelope shape
+`GET /api/v1/products` returns no page/size/total/link metadata.
 
-For every successful JSON API endpoint, assert HTTP status is appropriate and body contains exactly the required top-level fields `code`, `message`, and `data` (future optional fields require contract updates). Confirm there is no duplicate `success` flag or redundant HTTP status field.
+### TC-API-006 — Unsupported media/malformed body
 
-### TC-API-002 — Error envelope shape
+Unsupported content type, truncated JSON, invalid encoding, JSON array/scalar instead of object, and empty body where required fail safely without side effects.
 
-For each API error, assert the same envelope shape is returned, `code` agrees with HTTP status, and `data` is an object for validation details or `null` when there are none.
+### TC-API-007 — Method mismatch
 
-### TC-API-003 — Correct content type
+Unsupported methods return consistent 405/no mutation. GET/HEAD/OPTIONS never mutate products. TRACE is disabled.
 
-JSON endpoints return `application/json` with UTF-8. OAuth authorization/callback routes use browser redirects and are not forced into JSON envelopes.
+### TC-API-008 — Security filter envelope
 
-### TC-API-004 — No-content responses are avoided
+Trigger JWT parser and authorization failures before controller execution. Confirm Spring Security filter errors use the documented envelope, not framework HTML/default bodies.
 
-Successful hide/logout operations return a JSON envelope and HTTP 200, not 204 with an empty body.
+### TC-API-009 — Safe errors
 
-### TC-API-005 — Stable application codes
+No stack traces, signing material, password hashes, provider raw responses, or credentials appear in errors or logs.
 
-Assert clients can distinguish codes without parsing `message`; messages may change while codes remain stable.
+### TC-API-010 — Cache controls
 
-### TC-API-006 — Safe error messages
+Token-bearing responses and user-specific reads are not stored in shared caches. Verify appropriate `Cache-Control` headers.
 
-Verify responses do not reveal password hashes, stack traces, signing keys, raw provider errors, tokens, whether an email exists during sign-in, or other secrets.
+## 4. JWS/JWT format and validation
 
-### TC-API-007 — Unsupported media type
+### TC-JWT-001 — Three compact segments
 
-Submit a body with an unsupported content type. Expect 415 with the standard envelope and no side effects.
+Decode the JWT returned by sign-in. Assert exactly three dot-separated segments and that each segment uses Base64URL alphabet/decoding. Header and payload are readable JSON; signature validates.
 
-### TC-API-008 — Malformed JSON
+### TC-JWT-002 — It is signed, not encrypted
 
-Send truncated JSON, invalid encoding, JSON array where object is required, and scalar JSON. Expect a safe 400 envelope; server remains available.
+Confirm the token follows signed compact JWS (`header.payload.signature`), not five-part JWE. UI explains Base64URL is encoding, not encryption, and does not display claims as secret.
 
-### TC-API-009 — Unexpected exception
+### TC-JWT-003 — Supported signing algorithm only
 
-Cause a controlled internal failure in a test environment. Expect generic 500 envelope; no stack trace, token, or secret is returned.
+Token header algorithm matches the explicitly configured algorithm. Reject `alg: none`, empty/missing alg, unsupported algorithm, wrong key type, and algorithm-confusion attempts.
 
-### TC-API-010 — HTTP method mismatch
+### TC-JWT-004 — Signature tampering
 
-Call each endpoint with unsupported methods. Expect a consistent 405 response policy and no mutation. If 405 is added to the documented error status table, preserve the envelope.
+Alter header, payload, or signature independently. Protected endpoints return 401 and do not execute controller logic.
 
-### TC-API-011 — No pagination contract
+### TC-JWT-005 — Required claims
 
-Call `GET /api/v1/products`; confirm fixed product list is returned without `page`, `size`, `totalElements`, or pagination links.
+Reject missing/invalid subject, expiration, issued-at, issuer, audience, or token identifier where required by final policy. Reject future `iat`, expired tokens, and malformed claim types.
 
-## 5. UC-01 — CSRF token bootstrap
+### TC-JWT-006 — Wrong issuer/audience/environment
 
-Endpoint: `POST /api/v1/csrf-token`.
+Reject a correctly signed token issued for a different issuer, audience, or environment.
 
-### Credential requirements by request stage
+### TC-JWT-007 — Untrusted JOSE headers
 
-| Request stage | JWT required? | CSRF header required? | Reason |
-|---|---:|---:|---|
-| `POST /api/v1/csrf-token` bootstrap | No | No | This first request obtains the pre-auth CSRF token; requiring that token here would create a bootstrap loop. |
-| `POST /api/v1/auth/signup` | No | Yes, pre-auth token | Registration happens before an authenticated JWT exists. |
-| `POST /api/v1/auth/signin` | No | Yes, pre-auth token | Sign-in creates the JWT, so it cannot require that JWT in the same request. |
-| Authenticated `POST`, `PUT`, `PATCH`, `DELETE` (product writes/logout) | Yes | Yes, token associated with the login context | These are the protected state-changing operations covered by the dual-header policy. |
-| Protected read-only `GET` | Yes | No | GET is not a state-changing operation under this API contract. |
-| OAuth callback | No application JWT yet | OAuth `state`, not app CSRF/JWT | The provider callback is validated using the OAuth flow; the app JWT is issued after successful callback. |
+Test unknown `kid`, path-like key ID, `jku`, `x5u`, embedded `jwk`, and control characters. Never fetch attacker-selected key URLs or interpret `kid` as a filesystem path.
 
-The requirement is therefore: **all authenticated state-changing business endpoints require both JWT and CSRF**. It does not apply literally to the bootstrap endpoint or pre-authentication endpoints. The CSRF bootstrap call shown below without JWT is intentional and is not a test contradiction.
+### TC-JWT-008 — Oversized/ambiguous Authorization
 
-### TC-CSRF-001 — Issue a pre-auth token
+Very large JWT/header, duplicate Authorization headers, combined multiple values, missing token after `Bearer`, wrong scheme, and whitespace variants fail safely and with bounded resource use.
 
-Call without JWT. Expect 200 envelope with non-empty `data.token`, `data.headerName == "X-CSRF-TOKEN"`, and valid `expiresAt`.
+### TC-JWT-009 — Identity/authority tampering
 
-### TC-CSRF-002 — Token has sufficient unpredictability
+Modify subject, email, provider, or role claims and re-sign with an invalid key. Reject. Ignore identity/authority fields supplied in product bodies.
 
-Request multiple tokens across independent client contexts. Confirm tokens are not constant, sequential, timestamps, email-derived, or otherwise guessable. Do not print real values in CI logs.
+### TC-JWT-010 — Expiry boundary
 
-### TC-CSRF-003 — Bootstrap retry behavior
+Test immediately before/at/after `exp`, plus small configured clock skew. Expired JWT is rejected consistently.
 
-Repeat the request within the documented lifetime. Confirm behavior matches the contract (stable token or intentional rotation) and that prior frontend behavior does not become silently invalid.
+### TC-JWT-011 — Client does not persist JWT
 
-### TC-CSRF-004 — Expired pre-auth token
+Inspect cookies, localStorage, sessionStorage, IndexedDB, URLs, and logs after sign-in. JWT exists only in memory and transient request Authorization header.
 
-Use an expired token on sign-up/sign-in. Expect 403 `CSRF_INVALID` (or the documented pre-auth CSRF error) and no account/authentication side effect.
+### TC-JWT-012 — Reload/logout lifecycle
 
-### TC-CSRF-005 — Missing pre-auth token on signup
+Reload clears in-memory JWT and requires sign-in. Logout clears client token. If server revocation is absent, copied JWT may remain valid until expiry; ensure product/UI does not claim revocation.
 
-Submit valid signup body without `X-CSRF-TOKEN`. Expect rejection and no account created.
+## 5. UC-01 — Sign up
 
-### TC-CSRF-006 — Missing pre-auth token on signin
-
-Submit valid login body without pre-auth CSRF header. Expect rejection and no JWT returned.
-
-### TC-CSRF-007 — Random or tampered pre-auth token
-
-Modify one character or submit an unrelated value. Expect rejection; do not authenticate or create an account.
-
-### TC-CSRF-008 — Wrong header name
-
-Send the token under `X-CSRF-TOKEN-ALT` or in an uncontracted body field. Expect rejection.
-
-### TC-CSRF-009 — Header whitespace and normalization
-
-Test leading/trailing whitespace, empty string, whitespace-only, and duplicate header instances. Reject invalid/ambiguous values consistently.
-
-### TC-CSRF-010 — Token is not put in URL
-
-Inspect API responses, redirects, and generated links. Confirm CSRF token is never included in a query string or URL fragment.
-
-### TC-CSRF-011 — Token is not logged
-
-Inspect application and test logs for raw CSRF values. Confirm they are redacted/absent.
-
-### TC-CSRF-012 — No cookie side effect
-
-Confirm CSRF bootstrap does not create an authentication/session cookie or place token in `Set-Cookie`, consistent with JWT-only design.
-
-## 6. UC-02 — Sign-up
-
-Endpoint: `POST /api/v1/auth/signup`; requires pre-auth `X-CSRF-TOKEN`, no JWT.
+Endpoint: `POST /api/v1/auth/signup`; no JWT required.
 
 ### TC-SIGNUP-001 — Valid new account
 
-Submit valid email/password with valid pre-auth CSRF. Expect 201 `CREATED`, safe user summary, no JWT, and no password/hash in response. Account is available for sign-in in the current backend process.
+Valid email/password returns 201 `CREATED` and safe user summary. No JWT or password/hash in response. User can sign in before backend restart.
 
-### TC-SIGNUP-002 — Duplicate email exact match
+### TC-SIGNUP-002 — Duplicate email
 
-Submit the same email again. Expect 409 `EMAIL_ALREADY_REGISTERED`, stable envelope, no duplicate account.
+Exact duplicate returns 409 `EMAIL_ALREADY_REGISTERED`; no duplicate account is created.
 
-### TC-SIGNUP-003 — Duplicate email case variation
+### TC-SIGNUP-003 — Canonical email edge cases
 
-Register `User@Example.test`, then try a case variation. Confirm canonicalization/uniqueness policy and expected conflict behavior; document if case-sensitive by design.
+Case variations, leading/trailing whitespace, Unicode, long email, missing `@`, multiple `@`, empty/null values. Confirm validation and normalization policy consistently avoids duplicate identities.
 
-### TC-SIGNUP-004 — Email whitespace
+### TC-SIGNUP-004 — Password validation
 
-Test leading/trailing whitespace. Confirm documented trim/reject policy and prevent duplicate identities caused by whitespace.
+Missing, empty, whitespace-only, too short, too long, Unicode, newline, and special characters. Apply documented bounds and do not echo input.
 
-### TC-SIGNUP-005 — Invalid email boundaries
+### TC-SIGNUP-005 — Untrusted extra properties
 
-Test empty, missing `@`, multiple `@`, invalid domain, Unicode address, extremely long address, and leading/trailing spaces. Expect 400 field errors and no account creation when invalid.
+Submit `role`, `admin`, `userId`, `provider`, `passwordHash`, or status fields. Ignore/reject; caller cannot self-assign identity or privilege.
 
-### TC-SIGNUP-006 — Password boundary values
+### TC-SIGNUP-006 — Concurrent duplicate registration
 
-Test missing, empty, too short, too long, Unicode, whitespace-only, and password containing special characters. Expect documented validation without echoing the value.
+Submit simultaneous same-email registrations. At most one succeeds; others receive conflict; no corrupted in-memory account state.
 
-### TC-SIGNUP-007 — Missing/null fields
+### TC-SIGNUP-007 — In-memory reset
 
-Test missing email, missing password, explicit `null`, and unexpected JSON types. Expect 400 validation errors.
+Create account, verify sign-in, restart backend, then verify account no longer exists as documented.
 
-### TC-SIGNUP-008 — Untrusted extra fields
+### TC-SIGNUP-008 — No auth credential required
 
-Submit fields such as `role`, `admin`, `userId`, `provider`, or `passwordHash`. They must be ignored or rejected; caller must not assign privileges or identity IDs.
+Sign-up succeeds without Authorization because this endpoint creates the account before authentication.
 
-### TC-SIGNUP-009 — Invalid CSRF with valid body
+## 6. UC-02 — Sign in
 
-Use missing, expired, random, wrong-context, or malformed pre-auth token. Expect CSRF rejection and no account created.
-
-### TC-SIGNUP-010 — No JWT required before signup
-
-Submit a valid pre-auth CSRF token without Authorization header. Expect normal signup success; the API must not require a JWT that signup is meant to precede.
-
-### TC-SIGNUP-011 — In-memory persistence boundary
-
-Create account, confirm sign-in works before restart, restart backend, then confirm account is absent as documented. Ensure no unintended persistent file/database is created.
-
-### TC-SIGNUP-012 — Concurrent duplicate registration
-
-Submit simultaneous registrations for the same canonical email. At most one succeeds; others receive conflict, with no duplicate in-memory account.
-
-## 7. UC-03 — Sign-in
-
-Endpoint: `POST /api/v1/auth/signin`; requires pre-auth CSRF, no JWT.
+Endpoint: `POST /api/v1/auth/signin`; no JWT required.
 
 ### TC-SIGNIN-001 — Valid credentials
 
-Sign in with an existing account and valid pre-auth CSRF token. Expect 200 `OK`, bearer token, token type `Bearer`, expiry, user summary, and CSRF token associated with the new login context.
+Correct credentials return 200 envelope with token type `Bearer`, expiry, signed compact JWS, and safe user summary.
 
-### TC-SIGNIN-002 — Unknown email
+### TC-SIGNIN-002 — Unknown email/wrong password
 
-Use an unregistered email and valid CSRF. Expect generic 401 `INVALID_CREDENTIALS`; response must not confirm whether the email is registered.
+Both cases return generic 401 `INVALID_CREDENTIALS`; response does not reveal account existence.
 
-### TC-SIGNIN-003 — Wrong password
+### TC-SIGNIN-003 — Missing/invalid fields
 
-Use known email and incorrect password. Expect the same public error code/message style as unknown email.
+Missing/null email/password, invalid email, wrong JSON types, and malformed JSON return 400; no JWT issued.
 
-### TC-SIGNIN-004 — Missing/invalid pre-auth CSRF
+### TC-SIGNIN-004 — No JWT required to sign in
 
-Try absent, expired, random, malformed, wrong-name, duplicate, and whitespace-only CSRF headers. Expect rejection before credentials produce a JWT.
+Valid login succeeds without Authorization header. Sign-in cannot require the JWT it is about to issue.
 
-### TC-SIGNIN-005 — No existing JWT required
+### TC-SIGNIN-005 — No cookie
 
-Call sign-in without Authorization. Valid credentials plus pre-auth CSRF must succeed; sign-in cannot require the token it creates.
+Inspect response headers; no auth/session/JWT cookie is set.
 
-### TC-SIGNIN-006 — Unexpected `mode` field
+### TC-SIGNIN-006 — JWS claims
 
-Send `mode: SESSION`, `mode: JWT`, or other unknown mode. Contract says JWT-only and no mode field; reject or ignore consistently, never create a session-cookie mode.
+Validate signature, expiry, issuer/audience/subject and other claims per final policy. No provider token or secret in payload.
 
-### TC-SIGNIN-007 — No authentication cookie
+### TC-SIGNIN-007 — In-memory account reset
 
-Inspect all response headers, including `Set-Cookie`. Confirm sign-in does not issue a session or JWT cookie.
+After backend restart, prior in-memory account fails with generic credentials error.
 
-### TC-SIGNIN-008 — Password never echoed
+## 7. UC-03/04 — Google and Facebook OAuth
 
-Inspect body and logs. Confirm password and password hash are absent.
+Routes: Google `GET /oauth2/authorization/google`, callback `/login/oauth2/code/google`; Facebook equivalents. Run scenarios for both providers when credentials are configured.
 
-### TC-SIGNIN-009 — Token claims and expiry
+### TC-OAUTH-001 — Start provider flow
 
-Validate signature, issuer/audience policy if configured, subject, `jti`, and expiration. Reject not-yet-valid/expired tokens and malformed claims.
+Provider button opens the correct authorization route, expected client registration and minimal required scopes.
 
-### TC-SIGNIN-010 — Repeated sign-in
+### TC-OAUTH-002 — OAuth state generated/validated
 
-Sign in repeatedly. Confirm each issued JWT/CSRF pair follows the configured expiry and association policy; token from one login must not accidentally validate as another login's CSRF token if login contexts are distinct.
+State is unpredictable, bound to initiating flow, validated on callback, and consumed once. Missing, tampered, expired, replayed, cross-browser, and cross-provider state is rejected.
 
-### TC-SIGNIN-011 — Account store reset
+### TC-OAUTH-003 — Success and account mapping
 
-After backend restart, sign in with an account created only in memory. Expect generic invalid credentials.
+Successful provider auth maps by stable provider subject; provider and allowed profile claims appear in shop. No duplicate account on repeat login.
 
-### TC-SIGNIN-012 — Rate/concurrency edge
+### TC-OAUTH-004 — Provider authorization code stays backend-side
 
-Submit parallel sign-in attempts and rapid repeated failures in a local test profile. Ensure no account lock corruption or unhandled exceptions. If rate limiting is added, assert its documented response separately.
+Provider code is exchanged server-to-server and never forwarded to frontend or used as app bearer token.
 
-## 8. UC-04 / UC-05 — OAuth sign-in
+### TC-OAUTH-005 — Provider token separation
 
-Routes:
+Google/Facebook access token presented to app API is rejected unless explicitly supported (not in this contract).
 
-- Google: `GET /oauth2/authorization/google`, callback `GET /login/oauth2/code/google`.
-- Facebook: `GET /oauth2/authorization/facebook`, callback `GET /login/oauth2/code/facebook`.
+### TC-OAUTH-006 — Consent denied/provider error
 
-Run each scenario for both providers where provider setup permits. Use provider sandbox/test accounts; never commit client secrets.
+Deny consent or simulate provider 5xx/timeout at redirect, code exchange, user-info, and app-token issuance. User remains unauthenticated; no partial account/token state.
 
-### TC-OAUTH-001 — Authorization start
+### TC-OAUTH-007 — Invalid provider configuration
 
-Click each provider button. Confirm browser redirects to the correct provider registration and requested scopes are minimal and documented.
+Missing/wrong client ID/secret fails safely; no secret appears in error/log.
 
-### TC-OAUTH-002 — OAuth state generated
+### TC-OAUTH-008 — Missing/unverified email
 
-Confirm authorization request includes unpredictable `state` and that state is bound to the initiating browser flow per Spring Security configuration.
+No email, unverified email, changed email, or mismatched identity follows explicit linking policy. Never merge accounts solely by unverified email.
 
-### TC-OAUTH-003 — Successful provider login
+### TC-OAUTH-009 — OAuth provider mix-up
 
-Complete provider authentication and consent. Confirm application identity is mapped/provisioned, provider is recorded, and shop redirect occurs.
+Send Google response to Facebook callback and vice versa; validate issuer, registration, client ID, and provider identity; reject mismatch.
 
-### TC-OAUTH-004 — Handoff code exchanged for app credentials
+### TC-OAUTH-010 — Redirect allowlist
 
-After successful provider callback, verify the backend redirects only with a short-lived application handoff code. Frontend sends it to `POST /api/v1/auth/oauth/exchange` with the pre-auth CSRF header. Expect JSON envelope containing the application JWT and login-associated CSRF token. Provider authorization code, JWT, and CSRF token must not appear in the redirect URL.
+Malicious `returnUrl`, absolute URL, protocol-relative URL, encoded external URL, and Host-header manipulation cannot cause open redirect.
 
-### TC-OAUTH-005 — Provider identity shown safely
+### TC-OAUTH-011 — Token leakage
 
-Confirm shop shows provider name and only allowed profile claims; no provider access token or unnecessary raw claims are exposed.
+JWT/provider token never appears in callback URL, query, fragment, logs, analytics, or referrer. Callback page uses no-store/no-referrer, no third-party assets, and removes handoff code from history promptly.
 
-### TC-OAUTH-006 — Consent denied
+### TC-OAUTH-012 — Default Spring OAuth state storage
 
-Deny consent at Google/Facebook. Confirm user remains unauthenticated, receives safe feedback, and no app JWT is issued.
+Spring Security default authorization request repository stores OAuth request in HttpSession. Verify actual `Set-Cookie`; decide whether a transient OAuth-only session is allowed or configure a secure alternative. Do not disable state validation to avoid the cookie.
 
-### TC-OAUTH-007 — State missing
+## 8. UC-05 — OAuth handoff exchange
 
-Remove `state` from callback. Reject callback; no account/JWT.
+Endpoint: `POST /api/v1/auth/oauth/exchange`; no JWT yet.
 
-### TC-OAUTH-008 — State tampered
+### TC-HANDOFF-001 — Valid code exchange
 
-Change callback state. Reject and record safe security event; no account/JWT.
+Valid code returns 200 JSON envelope with app JWS and user summary. Code is consumed exactly once.
 
-### TC-OAUTH-009 — State replay
+### TC-HANDOFF-002 — Expired/replayed/malformed code
 
-Replay a previously successful callback/state. Reject if the state is one-time; confirm no duplicate login/account side effect.
+Expired, already-used, random, altered, truncated, malformed, wrong-provider, or wrong-transaction code fails without issuing JWT.
 
-### TC-OAUTH-010 — Callback from another browser/context
+### TC-HANDOFF-003 — Concurrent redemption
 
-Start flow in browser context A and replay callback in context B. Reject state/context mismatch.
+Redeem same code from two concurrent requests/workers; at most one receives credentials.
 
-### TC-OAUTH-011 — Invalid authorization code
+### TC-HANDOFF-004 — Popup postMessage
 
-Use expired, already-used, malformed, or wrong-client authorization code. Fail safely with no token leak.
+Callback posts code only to exact configured origin. Opener validates `event.origin`, `event.source`, and payload shape; unexpected origin/source is ignored.
 
-### TC-OAUTH-012 — Provider unavailable/timeout
+### TC-HANDOFF-005 — Same-tab flow
 
-Simulate DNS/connectivity timeout, provider 5xx, or token endpoint timeout. Show recoverable error, remain signed out, and avoid duplicate account creation.
+If selected, callback redeems code once, then replaces URL so refresh/back does not expose/redeem it again.
 
-### TC-OAUTH-013 — Invalid/missing client configuration
+### TC-HANDOFF-006 — Handoff store expiry/failure
 
-Run without client ID/secret or with wrong credentials. Startup or login failure must be clear and must not expose secrets.
+Expired state is cleaned. If Redis is used, test TTL, atomic consumption, outage/eviction and fail-closed behavior. Never store JWT signing key in Redis.
 
-### TC-OAUTH-014 — Email claim absent/unverified
+### TC-HANDOFF-007 — Exchange retry/network ambiguity
 
-Provider returns no email or an unverified email. Apply documented linking policy; do not link to an existing local account solely on an unverified claim.
+Network failure before redemption may retry within code lifetime. If code is consumed but response lost, fail safely and restart OAuth rather than issuing duplicate credentials.
 
-### TC-OAUTH-015 — Provider account already linked
-
-Repeat OAuth login with same provider subject. Reuse the same local identity; do not create duplicates.
-
-### TC-OAUTH-016 — Same email from different providers
-
-Log in with matching email from Google and Facebook. Confirm account linking follows explicit policy and does not silently merge identities based only on email.
-
-### TC-OAUTH-017 — OAuth callback is not JSON envelope
-
-Confirm callback behavior is redirect-based as contracted, while any API error/status endpoint still uses the standard JSON envelope.
-
-### TC-OAUTH-018 — Provider token separation
-
-Attempt to use Google/Facebook provider access token as `Authorization: Bearer` for app endpoints. Reject unless explicitly supported (not in this contract).
-
-### TC-OAUTH-019 — Handoff code is single-use
-
-Redeem the code once successfully, then replay it. The replay must fail and must not issue a second JWT/CSRF pair.
-
-### TC-OAUTH-020 — Handoff code expiration and tampering
-
-Test expired, random, truncated, altered, malformed, wrong-provider, and wrong-transaction codes. Fail safely without issuing credentials.
-
-### TC-OAUTH-021 — Exchange requires pre-auth CSRF
-
-Call exchange with a valid handoff code but absent, expired, random, or wrong-context pre-auth CSRF. Expect 403 and ensure code-consumption behavior is deliberate: invalid-CSRF attempts must not let an attacker consume another browser's valid code.
-
-### TC-OAUTH-022 — Popup message origin validation
-
-For popup mode, confirm callback page posts only to the exact configured frontend origin. Reject messages from unexpected origins and ensure the opener validates `event.origin`, `event.source`, provider transaction, and expected message shape before exchanging the code.
-
-### TC-OAUTH-023 — Handoff code URL hygiene
-
-Confirm callback page uses no-store/no-referrer policy, loads no third-party assets, removes the code from browser history promptly, and never logs or analytics-captures it.
-
-### TC-OAUTH-024 — Same-tab callback
-
-If same-tab mode is selected, frontend consumes the handoff code once, exchanges it, then replaces the callback URL so refresh/back navigation cannot redeem or expose it again.
-
-### TC-OAUTH-025 — Exchange outage and retry
-
-If network fails before code redemption, allow the documented retry behavior while code is still valid. If backend consumes code but response is lost, fail safely and require restarting OAuth rather than issuing duplicate credentials.
-
-## 9. UC-06 — Homepage and fixed catalog
+## 9. UC-06 — Homepage and mock catalog
 
 Endpoints: `GET /api/v1/homepage`, `GET /api/v1/products`; JWT required.
 
-### TC-SHOP-001 — Authenticated homepage
+### TC-SHOP-001 — Valid bearer reads
 
-Call with valid JWT. Expect 200 envelope, safe user summary, shop name, and no secrets.
+Valid JWT returns safe homepage and product data in envelope.
 
-### TC-SHOP-002 — Unauthenticated homepage
+### TC-SHOP-002 — Missing/invalid/expired bearer
 
-Call without Authorization. Expect 401 envelope.
+Each protected GET returns 401 without data leak.
 
-### TC-SHOP-003 — Invalid JWT homepage
+### TC-SHOP-003 — Fixed catalog/no pagination
 
-Use malformed, expired, wrong-signature, wrong-audience, or unsupported token. Expect 401 envelope with no claims leaked.
+Catalog is stable across requests/restart and has no pagination properties.
 
-### TC-SHOP-004 — Fixed catalog response
+### TC-SHOP-004 — Read-only does not mutate
 
-Call products endpoint with valid JWT. Expect same canonical mock catalog, valid product shape, no pagination metadata, no DB dependency.
+Repeated GET, HEAD, or OPTIONS does not add/hide products.
 
-### TC-SHOP-005 — Catalog stable across backend restart
+### TC-SHOP-005 — XSS-like display values
 
-Restart backend and fetch catalog. Fixed mock catalog remains available and unchanged.
-
-### TC-SHOP-006 — Concurrent reads
-
-Send parallel homepage/catalog requests. Responses remain valid, independent, and enveloped.
-
-### TC-SHOP-007 — Product list does not mutate state
-
-Repeat GET and confirm no localStorage changes or product side effects occur.
-
-### TC-SHOP-008 — Missing/invalid client storage
-
-Test absent storage, malformed JSON, wrong schema, null values, huge arrays, duplicate local IDs, and quota errors. UI recovers to server mock catalog, handles errors, and does not crash.
-
-### TC-SHOP-009 — XSS-like mock data
-
-Render product fields containing HTML/script strings. Ensure UI escapes text and does not execute injected markup.
+HTML/script-like text in product/user display fields is rendered escaped; no script execution.
 
 ## 10. UC-07 — Add product
 
-Endpoint: `POST /api/v1/products`; requires valid JWT plus login-associated CSRF header.
+Endpoint: `POST /api/v1/products`; JWT required.
 
-### TC-ADD-001 — Valid product
+### TC-ADD-001 — Valid add
 
-Send valid JWT, matching CSRF token, and valid product. Expect 201 envelope with product acknowledgement. Only after success is the product stored in localStorage and rendered.
+Valid JWT and product receive 201 envelope. Frontend saves product locally only after successful response.
 
-### TC-ADD-002 — Missing Authorization
+### TC-ADD-002 — Missing/invalid JWT
 
-Send valid CSRF and body but no JWT. Expect 401 and no localStorage update.
+No Authorization, wrong scheme, expired/invalid signature, ambiguous duplicate headers return 401; no local state change.
 
-### TC-ADD-003 — Missing CSRF header
+### TC-ADD-003 — Field validation
 
-Send valid JWT and body without CSRF. Expect 403 `CSRF_INVALID`; no localStorage update.
+Empty/overlong name, negative/missing/non-finite price, invalid currency, malformed/unsafe image URL, oversized description, invalid ID, wrong field types, and unexpected ownership/role fields are rejected safely.
 
-### TC-ADD-004 — Invalid/expired JWT
+### TC-ADD-004 — Duplicate ID/double submit
 
-Send invalid JWT with otherwise valid CSRF/body. Expect 401, not successful acknowledgement.
+Repeat click, retry after timeout, or collide with seed/local ID. UI does not create duplicate/ambiguous cards; backend does not claim persistence.
 
-### TC-ADD-005 — Invalid/expired CSRF
+### TC-ADD-005 — Backend outage/response mismatch
 
-Send valid JWT with random, malformed, expired, revoked, or tampered CSRF token. Expect 403 `CSRF_INVALID`.
-
-### TC-ADD-006 — CSRF token belongs to another JWT/login
-
-Use account A JWT with account B/login CSRF token. Expect rejection.
-
-### TC-ADD-007 — Credential pair from different logins
-
-Use JWT from one sign-in and CSRF token from another sign-in of the same user. Assert configured binding policy; if tokens are bound to `jti`, reject mismatch.
-
-### TC-ADD-008 — Authorization scheme errors
-
-Test `Basic`, lowercase/incorrect scheme if case-sensitive by contract, `Bearer` with missing token, two bearer values, surrounding whitespace, and duplicate Authorization headers. Reject consistently.
-
-### TC-ADD-009 — Both JWT and a stray cookie
-
-Send valid headers plus an unrelated cookie. Confirm server does not authenticate from cookies and does not create/require a session.
-
-### TC-ADD-010 — Empty/missing product name
-
-Expect 400 field error; no local persistence.
-
-### TC-ADD-011 — Name length boundaries
-
-Test 1, 100, and 101 characters plus very large body. Accept/reject per contract and enforce request-size limits safely.
-
-### TC-ADD-012 — Description boundaries
-
-Test absent, null, empty, 500, 501 chars, Unicode, emoji, and HTML/script. Apply limits and render safely.
-
-### TC-ADD-013 — Price boundaries
-
-Test zero, positive decimal, negative, missing, null, string, `NaN`, `Infinity`, too many decimal places, and very large magnitude. Accept only finite non-negative values under the agreed precision policy.
-
-### TC-ADD-014 — Currency validation
-
-Test valid uppercase 3-letter code, lowercase, wrong length, numeric, missing, and null. Enforce contract.
-
-### TC-ADD-015 — Image URL validation
-
-Test null, valid HTTPS URL, relative path, malformed URL, `javascript:` scheme, extremely long URL, and disallowed protocols. Reject unsafe values or use placeholder.
-
-### TC-ADD-016 — Client ID validation
-
-Test missing, empty, duplicate, malformed, extremely long, and injection-like IDs. Reject collisions/invalid IDs; do not trust IDs as authorization.
-
-### TC-ADD-017 — Unexpected fields
-
-Submit fields such as `ownerId`, `isAdmin`, server status, or hidden flag. Ignore/reject; never let client modify identity/privilege or bypass flow.
-
-### TC-ADD-018 — Cross-user product submission
-
-Attempt to set product owner to another user. There is no server-owned product state; reject/ignore uncontracted ownership fields.
-
-### TC-ADD-019 — Backend accepts but localStorage write fails
-
-Simulate quota exceeded, private mode/security exception, or disabled storage after a successful response. Show a persistence warning and accurately explain backend did not save it; avoid claiming durable success.
-
-### TC-ADD-020 — Network failure before response
-
-Drop connection. Do not update localStorage before confirmation; show retry option without creating duplicate local products.
-
-### TC-ADD-021 — Timeout after backend accepted
-
-Simulate response lost after backend acknowledgement. Since backend is non-persistent, retry must not create duplicate local entries; use stable client product ID/idempotent handling.
-
-### TC-ADD-022 — Rapid double-submit
-
-Double-click submit or press Enter repeatedly. Prevent duplicate UI/localStorage entries or handle same client ID idempotently.
-
-### TC-ADD-023 — Header values are never logged
-
-Verify backend logs redact Authorization and CSRF values for valid and rejected requests.
+Network failure or malformed/non-success envelope does not update localStorage. If storage write fails after success, report local persistence failure accurately.
 
 ## 11. UC-08 — Hide product
 
-Endpoint: `DELETE /api/v1/products/{productId}`; requires valid JWT plus associated CSRF header.
+Endpoint: `DELETE /api/v1/products/{productId}`; JWT required.
 
-### TC-HIDE-001 — Hide fixed catalog product
+### TC-HIDE-001 — Hide seed/local product
 
-Send valid headers for a seeded product ID. Expect 200 envelope with `hidden: true`; frontend saves ID in hidden collection and filters it out.
+Valid JWT receives success envelope; frontend records ID once and filters product out.
 
-### TC-HIDE-002 — Hide locally added product
+### TC-HIDE-002 — Missing/invalid JWT
 
-Add product, then hide it. Confirm it disappears and the ID appears only once in hidden storage.
+Returns 401; local hidden IDs remain unchanged.
 
-### TC-HIDE-003 — Missing JWT / invalid JWT
+### TC-HIDE-003 — Malformed/unknown ID
 
-Expect 401; local hidden-ID list remains unchanged.
+Test encoded slash, overlong segment, invalid characters, traversal-like strings, and unknown IDs. Reject malformed input; do not claim database deletion.
 
-### TC-HIDE-004 — Missing CSRF / invalid CSRF
+### TC-HIDE-004 — Repeat/concurrent hide
 
-Expect 403 `CSRF_INVALID`; local hidden-ID list remains unchanged.
+Repeated or concurrent DELETE is handled consistently; hidden ID is stored once and UI remains stable.
 
-### TC-HIDE-005 — CSRF bound to another login
+### TC-HIDE-005 — Failure before acknowledgement
 
-Use a token associated with another JWT. Expect 403.
+Network error, timeout, 4xx/5xx, or malformed envelope does not hide locally before success.
 
-### TC-HIDE-006 — Malformed product ID path
+## 12. UC-09 — Logout
 
-Test empty path, encoded slash, invalid characters, overlong segment, traversal-like strings, and percent-encoding variants. Reject safely; no local mutation.
-
-### TC-HIDE-007 — Unknown product ID
-
-Use unknown syntactically valid ID. Follow contract: backend can acknowledge because it does not own catalog membership; UI only hides matching local product if present. Do not imply server deletion.
-
-### TC-HIDE-008 — Repeated hide (idempotency)
-
-Repeat DELETE for same ID. The UI remains hidden and storage contains one ID; response behavior follows documented idempotent semantics.
-
-### TC-HIDE-009 — Hide then reload
-
-Reload shop. Product remains hidden because hidden ID is stored locally.
-
-### TC-HIDE-010 — Hide then clear browser storage
-
-Clear localStorage and reload. Seed product returns; this is expected because hide was browser-local.
-
-### TC-HIDE-011 — localStorage failure after success
-
-Simulate storage write failure. Show error/refresh recovery accurately; backend did not persist deletion.
-
-### TC-HIDE-012 — Network failure/timeout
-
-Ensure the frontend does not hide until successful acknowledgement. On ambiguous timeout, avoid duplicate state or explain retry outcome.
-
-### TC-HIDE-013 — Concurrent hide requests
-
-Issue simultaneous DELETE requests for same ID. UI/storage converges to one hidden ID; no crash.
-
-### TC-HIDE-014 — Cross-account browser state
-
-Sign out and sign in as a different user in the same browser. Product storage is browser-local and may be visible to the next user. Test this behavior and document/reset storage on sign-out if product privacy is expected. Do not confuse local product state with account ownership.
-
-## 12. UC-09 — Combined JWT + CSRF request inspection
-
-### TC-COMBO-001 — Both headers present and valid
-
-For each authenticated state-changing route, send valid JWT and associated CSRF token. Expect operation success and correct envelope.
-
-### TC-COMBO-002 — JWT only
-
-Omit CSRF header. Expect 403 `CSRF_INVALID` on state-changing authenticated route.
-
-### TC-COMBO-003 — CSRF only
-
-Omit JWT. Expect 401; do not reveal whether CSRF was valid.
-
-### TC-COMBO-004 — Both absent
-
-Expect 401 or the documented authentication-first response, consistently. No mutation.
-
-### TC-COMBO-005 — Wrong pair
-
-Mix JWT and CSRF token from different users/login contexts. Reject.
-
-### TC-COMBO-006 — Read-only GET behavior
-
-Call homepage, products, and auth-context GET with valid JWT but no CSRF header. Expect success; GET responses do not require CSRF per contract.
-
-### TC-COMBO-007 — Header inspection UI
-
-Confirm request preview shows both header names and masks token values by default. If reveal is supported, it is local-only, opt-in, and never copied to logs.
-
-### TC-COMBO-008 — Method tampering
-
-Change a protected POST to GET or an unprotected method. Confirm server does not perform a state change through safe methods; unknown methods are rejected.
-
-### TC-COMBO-009 — CORS/preflight
-
-From a disallowed origin, attempt requests with Authorization and X-CSRF-TOKEN. Reject disallowed origin; do not reflect arbitrary origins or allow credentials unnecessarily. For approved frontend origin, preflight only allows required methods/headers.
-
-### TC-COMBO-010 — Content-type downgrade
-
-Attempt form-encoded or `text/plain` request to a JSON mutation endpoint. Reject unsupported content types and do not mutate local/backend state.
-
-## 13. UC-10 — Logout
-
-Endpoint: `DELETE /api/v1/auth/sessions`; requires JWT + CSRF header.
+Endpoint: `DELETE /api/v1/auth/sessions`; JWT required.
 
 ### TC-LOGOUT-001 — Valid logout
 
-Send valid JWT and associated CSRF token. Expect 200 envelope with `data: null`; frontend clears JWT and CSRF state from memory and navigates to sign-in. Product localStorage remains.
+Returns 200 envelope; frontend clears in-memory JWT and navigates to sign-in. Product localStorage remains.
 
 ### TC-LOGOUT-002 — Missing/invalid JWT
 
-Expect 401 and no false success message.
+Returns 401; UI does not claim successful server revocation.
 
-### TC-LOGOUT-003 — Missing/invalid/mismatched CSRF
+### TC-LOGOUT-003 — Repeated logout
 
-Expect 403 `CSRF_INVALID`; client must not claim successful logout if backend rejects.
+Repeated logout after client clears token is handled gracefully and consistently.
 
-### TC-LOGOUT-004 — Repeat logout
+### TC-LOGOUT-004 — Old JWT after logout
 
-Repeat after client has cleared credentials. UI returns to signed-out state gracefully; API returns documented unauthenticated response or idempotent response consistently.
+If no revocation list exists, copied JWT may remain valid until expiry. Verify actual policy and do not claim otherwise.
 
-### TC-LOGOUT-005 — Old JWT after logout
+## 13. Client token lifecycle and transport edge cases
 
-Attempt protected calls with copied pre-logout JWT. Because stateless JWT may remain valid until expiry without revocation, verify actual configured policy and ensure UI/docs do not claim revocation if none exists.
+### TC-CLIENT-001 — Memory-only JWT
 
-### TC-LOGOUT-006 — Clear credentials but preserve shop state
+JWT absent from cookies, localStorage, sessionStorage, IndexedDB, URL, and persistent logs.
 
-Confirm JWT and CSRF are removed from memory, while local product additions/hidden IDs persist per use-case contract.
+### TC-CLIENT-002 — Reload
 
-### TC-LOGOUT-007 — Browser refresh after logout
+Reload loses in-memory JWT and requires sign-in; local product state remains.
 
-Refresh and confirm protected UI does not reappear without a valid in-memory JWT; unauthenticated state is shown.
+### TC-CLIENT-003 — Sign-out cleanup
 
-## 14. Frontend token lifecycle and security edge cases
+No stale Authorization header is sent after logout; token references removed from app state/interceptors.
 
-### TC-CLIENT-001 — JWT not persisted
+### TC-CLIENT-004 — Token sent only to API origin
 
-Inspect localStorage, sessionStorage, IndexedDB, cookies, URLs, and logs after sign-in. JWT appears only in memory and intended transient network header.
+Never attach Authorization to image, analytics, provider, or arbitrary cross-origin URLs.
 
-### TC-CLIENT-002 — CSRF token not persisted
+### TC-CLIENT-005 — Multiple tabs
 
-Confirm CSRF token is not in localStorage/sessionStorage/cookie/URL. It remains in memory only.
+Tokens remain tab-local; product localStorage is shared browser state and must not be described as user-owned server data.
 
-### TC-CLIENT-003 — Reload behavior
+### TC-CLIENT-006 — CORS/preflight
 
-Reload the page. In-memory JWT/CSRF are gone; user must sign in again unless a refresh-token flow is later specified. Product local state remains.
+Disallowed origins cannot call protected endpoints; approved origin allows only required methods/headers. No arbitrary origin reflection.
 
-### TC-CLIENT-004 — Sign-out cleanup
+### TC-CLIENT-007 — Request size/abuse
 
-Clear token references from application state and request interceptors. Subsequent requests must not send stale Authorization or CSRF headers.
+Huge JWT/header/body and high-rate invalid requests are rejected with bounded resource use. Consider rate limiting signup, signin, OAuth start, exchange, and product writes.
 
-### TC-CLIENT-005 — Cross-origin header leakage
+### TC-CLIENT-008 — Filter-chain error mapping
 
-Ensure frontend only attaches JWT/CSRF to the configured API origin; never leak them to images, analytics, provider domains, or arbitrary URLs.
+Security-filter failures use the standard API envelope; no framework HTML or stack trace on API routes.
 
-### TC-CLIENT-006 — Multiple tabs
+## 14. Acceptance checklist
 
-Open two tabs, sign in/out or sign in as different accounts. In-memory tokens are tab-local; ensure no accidental cross-tab token leak. localStorage product state is shared and should be handled as browser-local shared data.
+- Local signup/signin returns a valid signed three-segment JWS and validates claims/signature.
+- No CSRF token endpoint, header, cookie, or validation rule remains.
+- Protected API requests require bearer JWT; sign-up/sign-in/OAuth exchange are documented pre-auth exceptions.
+- OAuth state and one-time handoff exchange are covered; JWT never enters redirect URLs.
+- Product operations update localStorage only after backend acknowledgement and do not imply server persistence.
+- Account reset, fixed catalog, logout limitations, and response envelope match docs.
 
-### TC-CLIENT-007 — XSS handling
+## 15. Open decisions affecting tests
 
-Render user/product text safely. Note that any active XSS could read in-memory JWT/CSRF; ensure UI never renders untrusted HTML and document token exposure as a learning boundary.
-
-### TC-CLIENT-008 — Clock skew/expiry boundary
-
-Test JWT/CSRF just before expiration, at expiration, and after expiration with small clock skew. Frontend handles 401/403 and clears/re-authenticates without infinite retry loops.
-
-### TC-CLIENT-009 — Concurrent API requests
-
-Send parallel requests near expiry. Ensure no request mixes token pairs from different login contexts and failures do not corrupt UI state.
-
-### TC-CLIENT-010 — Response caching
-
-Ensure token-bearing responses use appropriate no-store cache headers where needed; a shared cache must not serve one user's JWT/CSRF response to another user.
-
-## 15. OAuth and account lifecycle edge cases
-
-### TC-ACCOUNT-001 — Backend restart invalidates demo accounts
-
-Previously signed-up in-memory user is absent after restart. Sign-in returns generic invalid credentials; no stale credential data is exposed.
-
-### TC-ACCOUNT-002 — OAuth user after restart
-
-Confirm whether OAuth-linked account mapping is also in-memory or provider-derived. Test according to documented implementation; this persistence behavior must be explicitly decided before release.
-
-### TC-ACCOUNT-003 — OAuth JWT/CSRF pair lifecycle
-
-After OAuth callback, exchange the single-use handoff code and verify the frontend receives an app JWT and matching CSRF token; both expire/clear according to the login lifecycle.
-
-### TC-ACCOUNT-004 — Provider account unlink/revocation
-
-Provider revokes app consent or account access. Next OAuth attempt follows a safe re-consent/error path and does not reuse a provider token as an app token.
-
-### TC-ACCOUNT-005 — OAuth callback replay after logout
-
-Replay an old callback after logout. Reject stale state/code and do not silently restore a logged-in UI.
-
-## 16. Acceptance checklist
-
-The release candidate is acceptable when:
-
-- Every documented UC has at least one successful and relevant negative test.
-- Every JSON API response, including errors, follows the envelope and correct HTTP status.
-- Sign-up/sign-in use pre-auth CSRF but do not require JWT.
-- Authenticated state-changing endpoints require both JWT and login-associated CSRF token.
-- Read-only GET endpoints require JWT but not CSRF header.
-- OAuth `state` is validated and the one-time handoff-code exchange is covered; popup/same-tab UI mode is selected.
-- Product add/hide update localStorage only after backend acknowledgement and never claim server persistence.
-- Backend restart behavior for in-memory users and fixed catalog matches documentation.
-- JWT and CSRF values are not persisted to browser storage, cookies, URLs, or logs.
-- No pagination metadata is returned for the fixed catalog.
-- All unresolved contract decisions are closed or explicitly documented before their dependent tests are marked complete.
-
-## 17. Open contract decisions affecting tests
-
-1. Popup versus same-tab frontend presentation for the already-defined handoff-code exchange.
-2. Whether OAuth/CSRF ephemeral state stays in memory for the local single-instance app or uses Redis; if Redis is selected, define outage behavior, key TTLs, atomic consume operation, and deployment secrets.
-3. Exact JWT signing algorithm, issuer/audience, expiry, and `jti` policy.
-4. Exact association strategy and lifetime/revocation behavior for CSRF tokens.
-5. Whether pre-auth CSRF tokens are single-use and what error code represents expiry/replay.
-6. Canonical email normalization and password length/complexity rules.
-7. Product ID format, decimal precision, and malformed/unknown ID behavior.
-8. Whether rate limiting is in scope for sign-in and token bootstrap.
-9. Whether logout revokes JWT server-side or only clears client-held state.
-
-## 18. Adversarial review — additional bypass and edge-case scenarios
-
-These cases extend the baseline use-case tests by treating the API as if a hostile client can alter every request, replay every value it sees, race requests, and submit malformed or oversized input. Run only against the local/test application.
-
-### 18.1 Pre-auth CSRF bootstrap and login abuse
-
-#### TC-RED-CSRF-001 — Bootstrap endpoint flooding
-
-Issue a high volume of `POST /api/v1/csrf-token` requests from one client and across many synthetic clients. Confirm bounded memory/CPU usage, no unbounded token registry growth, and a documented throttling response if rate limiting is implemented.
-
-#### TC-RED-CSRF-002 — Pre-auth token context isolation
-
-Obtain token A in client context A and token B in context B. Try using A from B on sign-up/sign-in. Reject cross-context use if the design binds pre-auth tokens to a client context; otherwise document the intended threat model and rely on an explicitly designed stateless token validation scheme.
-
-#### TC-RED-CSRF-003 — Pre-auth token replay/use-after-consumption
-
-Replay the same pre-auth token after successful sign-up/sign-in, after expiration, and after a failed attempt. Verify the chosen policy (single-use or bounded reuse) and ensure an old token cannot mint unlimited login attempts contrary to policy.
-
-#### TC-RED-CSRF-004 — Login CSRF/account swapping
-
-Attempt to force a victim browser into an attacker-controlled account using a cross-site login submission. Verify the pre-auth token is unpredictable, inaccessible cross-origin, validated, and associated with the initiating client flow.
-
-#### TC-RED-CSRF-005 — CORS misconfiguration exposes pre-auth token
-
-From an untrusted origin, request the CSRF bootstrap with credential/header variations. Confirm the server does not reflect arbitrary `Origin`, does not allow wildcard origins together with credentials, and does not expose token response to hostile origins.
-
-#### TC-RED-CSRF-006 — Token registry growth and cleanup
-
-Create many pre-auth tokens, wait past expiry, and verify expired entries are removed or bounded. Verify expiry cleanup does not remove live tokens or make concurrent requests fail unexpectedly.
-
-#### TC-RED-CSRF-007 — Redis-backed state TTL and atomic consumption (if Redis is used)
-
-Verify CSRF/handoff records receive the configured TTL, expire automatically, and do not survive beyond JWT/code lifetime. Redeem the same handoff code concurrently from two workers; at most one request succeeds. Store only the intended opaque value/hash and association data, never JWT signing keys.
-
-#### TC-RED-CSRF-008 — Redis unavailable or evicted state (if Redis is used)
-
-Simulate Redis timeout, restart, eviction, and connection failure during token issue/validation/redemption. Fail closed for protected mutations and OAuth code exchange; return a safe envelope without issuing credentials or accepting an unvalidated request. Confirm recovery does not resurrect expired/replayed state.
-
-### 18.2 JWT parsing, validation, and identity confusion
-
-#### TC-RED-JWT-001 — Unsigned/`none` algorithm token
-
-Submit a token with no valid signature or an unsupported `alg` such as `none`. Expect 401; the server must allow only explicitly configured algorithms.
-
-#### TC-RED-JWT-002 — Algorithm/key confusion
-
-Try a token signed with a different algorithm or wrong key type. Expect 401; algorithm must not be selected solely from untrusted token headers.
-
-#### TC-RED-JWT-003 — Claim validation
-
-Test missing/invalid `sub`, `exp`, `iat`, `iss`, `aud`, and `jti`; future `iat`; expired `exp`; and impossible claim types. Reject malformed or policy-violating credentials.
-
-#### TC-RED-JWT-004 — Token substitution across environments
-
-Use development token against another environment/issuer/audience. Reject if issuer/audience/environment binding is configured; never accept a token solely because its signature verifies under a shared key.
-
-#### TC-RED-JWT-005 — Duplicate/ambiguous Authorization headers
-
-Send repeated Authorization headers, comma-combined values, multiple bearer tokens, or proxy-normalized duplicates. Reject ambiguity consistently; do not pick a weaker/attacker-controlled value.
-
-#### TC-RED-JWT-006 — Oversized token/header
-
-Submit a very large JWT and very large Authorization header. Reject with bounded resource use and safe response; avoid excessive logging or parser allocation.
-
-#### TC-RED-JWT-007 — JWT header injection fields
-
-Include untrusted `jku`, `x5u`, `kid` path traversal, remote key URLs, embedded `jwk`, or control characters. Server must not fetch attacker-provided key URLs or interpret key IDs as paths; reject unknown key IDs.
-
-#### TC-RED-JWT-008 — Subject/role tampering
-
-Change `sub`, email, provider, or role claims and re-sign with an invalid key. Reject. Ignore client-supplied identity/role fields in product request bodies.
-
-#### TC-RED-JWT-009 — Expiry race and clock skew
-
-Test at exact expiry boundaries and with backend clock skew. Expired tokens must fail consistently; allowed skew must be small and explicit.
-
-#### TC-RED-JWT-010 — Revocation and stale CSRF pairing
-
-After logout or token expiry, attempt a mutation with old JWT and matching old CSRF token. Enforce the documented revocation policy. If logout only clears client memory, confirm the server does not claim the JWT was revoked.
-
-### 18.3 CSRF-to-JWT association and mutation bypass
-
-#### TC-RED-PAIR-001 — Cross-user and cross-login token pairing
-
-Pair JWT A with CSRF B for another user, another login, and another provider. Every mismatch must fail before product/local UI state changes.
-
-#### TC-RED-PAIR-002 — Token from another token lifecycle stage
-
-Use pre-auth CSRF on an authenticated mutation, and authenticated CSRF on sign-up/sign-in. Enforce the separation defined by the API contract.
-
-#### TC-RED-PAIR-003 — CSRF token substitution/truncation/encoding
-
-Test one-byte change, URL/base64 encoding changes, Unicode normalization, null byte, CR/LF, tabs, and truncation. Reject invalid tokens and prevent header injection.
-
-#### TC-RED-PAIR-004 — Token replay on distinct mutations
-
-Reuse one valid CSRF token across several product mutations, including after logout, expiry, or re-login. Match the defined policy: if tokens are per-login, they may be reused only within that login lifetime; if one-time, a replay must fail. Do not accidentally mix policies.
-
-#### TC-RED-PAIR-005 — Method override bypass
-
-Try `_method=DELETE`, `X-HTTP-Method-Override`, query-string method overrides, lowercase methods, and alternate content types to bypass the CSRF guard. Ensure effective method is validated consistently and state changes cannot occur through a path that skips the dual-header filter.
-
-#### TC-RED-PAIR-006 — Route/path normalization bypass
-
-Test trailing slash, duplicate slash, encoded slash, dot segments, mixed case, semicolon path parameters, path parameters, and reverse-proxy normalization. Every route alias that reaches a mutation handler must enforce both headers.
-
-#### TC-RED-PAIR-007 — Filter-chain ordering
-
-Send invalid JWT plus invalid CSRF, valid JWT plus invalid CSRF, and malformed Authorization with missing CSRF. Confirm failures are deterministic, no controller executes, and error precedence does not disclose token validity unnecessarily.
-
-#### TC-RED-PAIR-008 — No mutation before all checks pass
-
-Inject failures after JWT parse, after CSRF verification, during product validation, and before response. Confirm no client localStorage update occurs unless a successful envelope is received; because backend has no product persistence, error handling must not invent server state.
-
-#### TC-RED-PAIR-009 — All unsafe verbs covered
-
-For every registered `POST`, `PUT`, `PATCH`, and `DELETE` route, including logout and future endpoints, verify security configuration requires the expected JWT/CSRF pair except the explicitly documented pre-authentication endpoints. Add a route-inventory test so a newly added mutation cannot silently omit the filter.
-
-#### TC-RED-PAIR-010 — Safe methods do not mutate
-
-Call GET/HEAD/OPTIONS variants with query/body parameters that resemble add/hide commands. Confirm they never change state. Disable TRACE and reject unsupported methods.
-
-### 18.5 OAuth protocol and no-session-cookie compatibility
-
-#### TC-RED-OAUTH-001 — Spring OAuth default state storage versus no-session policy
-
-The current project says it uses no session cookies, but Spring Security's default `AuthorizationRequestRepository` stores the OAuth authorization request in `HttpSession`. Verify actual `Set-Cookie` and callback behavior. If a transient session cookie appears, either explicitly allow/document that OAuth-only transient cookie or configure a secure custom state repository; do not claim that absolutely no session cookie exists without checking. Spring Security documents this default behavior in its [authorization grant reference](https://docs.spring.io/spring-security/reference/servlet/oauth2/client/authorization-grants.html).
-
-#### TC-RED-OAUTH-002 — OAuth state binding and replay
-
-Test missing, tampered, expired, replayed, cross-browser, and cross-provider `state`. Reject and consume state once. Ensure Google state cannot be replayed on Facebook callback or vice versa.
-
-#### TC-RED-OAUTH-003 — PKCE and OIDC nonce policy
-
-Confirm the exact flow's CSRF protections: state is securely bound to the initiating browser, and where OIDC nonce/PKCE is used, verify it on callback/token validation. Reject missing/mismatched values.
-
-#### TC-RED-OAUTH-004 — Authorization code leakage
-
-Ensure OAuth code, state, provider token, app JWT, and CSRF token are not written to logs, analytics, referrer-bearing links, or persistent browser history beyond unavoidable callback URL handling. Remove sensitive callback query parameters promptly after processing.
-
-#### TC-RED-OAUTH-005 — Open redirect / return URL injection
-
-Supply malicious `redirect`, `returnUrl`, encoded external URLs, protocol-relative URLs, and host-header manipulations. After OAuth success/failure, redirect only to an allowlisted local destination.
-
-#### TC-RED-OAUTH-006 — Provider mix-up
-
-Send a Google response to Facebook callback and vice versa; vary issuer, audience, client ID, and token endpoint responses. Reject provider mismatch and validate issuer/registration identity.
-
-#### TC-RED-OAUTH-007 — JWT/CSRF delivery channel
-
-Assert JWT and CSRF never appear in query parameters or URL fragments. The callback may carry only the one-time handoff code; verify its expiry, one-time use, URL cleanup, and exchange behavior.
-
-#### TC-RED-OAUTH-008 — Concurrent OAuth attempts
-
-Start two provider flows in parallel in the same browser, complete them in reverse order, and confirm each callback is matched to its own state/provider without overwriting another flow's token context.
-
-#### TC-RED-OAUTH-009 — Provider profile attack strings
-
-Return very long, malformed, Unicode-confusable, HTML/script-like, or unexpected profile claims. Validate expected types/lengths, render escaped text, and avoid using display name/email as the stable provider identity key.
-
-#### TC-RED-OAUTH-010 — OAuth email collision/account linking
-
-Test verified/unverified/missing email, same email across providers, and email changed at provider. Link by stable provider subject and explicit policy; never auto-merge solely by unverified email.
-
-#### TC-RED-OAUTH-011 — Provider timeout at each stage
-
-Simulate failures during authorization redirect, code exchange, user-info/ID-token retrieval, and app token creation. User stays signed out; no partial account/token state remains.
-
-### 18.7 Envelope, transport, and browser boundary attacks
-
-#### TC-RED-HTTP-001 — Authentication filter error envelope
-
-Trigger failures before controller execution (JWT parser, CSRF filter, OAuth failure, access denied). Confirm Spring Security filter-chain errors still use the agreed envelope; controller advice alone may not cover filter responses.
-
-#### TC-RED-HTTP-002 — Cache isolation
-
-Check `Cache-Control` on sign-in, CSRF-token, user-context, and protected responses. Ensure private/token-bearing responses cannot be cached/shared between users.
-
-#### TC-RED-HTTP-003 — Clickjacking/security headers
-
-Verify appropriate frame restrictions, content-type sniffing protection, referrer policy, and CSP for the shop UI; check that the request inspector's token reveal does not weaken policy.
-
-#### TC-RED-HTTP-004 — HTTPS and proxy headers
-
-In deployment-like test configuration, verify HTTPS is enforced and untrusted forwarded headers cannot spoof host/protocol/redirect URLs. Local development may document HTTP as a local-only exception.
-
-#### TC-RED-HTTP-005 — Request smuggling/header normalization
-
-Through the actual reverse proxy/runtime path, test duplicate Content-Length/Transfer-Encoding and malformed header cases where the test environment supports it. Reject or normalize consistently; do not let proxy and app disagree about request boundaries.
-
-#### TC-RED-HTTP-006 — Unicode and normalization attacks
-
-Test confusable characters in email, product IDs, provider names, and paths. Normalize identifiers consistently or reject unsupported forms; never let visually similar identities collapse unpredictably.
-
-#### TC-RED-HTTP-007 — Error precedence and information leak
-
-For requests with multiple faults (bad JSON + missing JWT, invalid JWT + bad CSRF, nonexistent account + wrong password), verify generic and stable public errors that do not reveal account/token validity unnecessarily.
-
-## 19. Security review findings and contract gaps
-
-The test plan now captures these important issues for implementation review:
-
-1. **CSRF bootstrap is intentionally unauthenticated.** It needs rate/resource controls and a clear pre-auth token lifecycle; no endpoint can require the first token it is responsible for issuing.
-2. **All state-changing endpoints need route-wide enforcement.** A newly added POST/PUT/PATCH/DELETE must not bypass the dual-header validator through a new path, method override, or filter-chain ordering issue.
-3. **JWT/CSRF binding must be real.** The server must associate CSRF with the JWT/login context and expiration; merely checking for two non-empty headers is not sufficient.
-4. **Logout does not necessarily revoke JWT.** With stateless JWT, old tokens may remain valid until expiry unless revocation is explicitly implemented.
-5. **OAuth may create a transient HTTP session.** Spring Security's default authorization-request repository stores state in `HttpSession`; this may conflict with a broad “no session cookie” requirement. Decide whether OAuth-only transient session state is allowed or configure a secure alternative.
-6. **OAuth uses a one-time handoff code.** JWT/CSRF must never appear in redirect URLs; test code expiry, one-time consumption, callback URL cleanup, and exact-origin popup messaging.
-7. **Filter-generated errors may escape the envelope.** Verify security filters and OAuth handlers, not just controller methods, use the common API response contract where applicable.
-
-Several behaviors remain intentionally undecided in the API contract. Tests that depend on them must remain pending until the contract is completed; do not silently treat an assumption as passing behavior.
+1. Signing algorithm, issuer, audience, expiry, and key rotation policy.
+2. OAuth popup versus same-tab UX.
+3. Whether OAuth-only transient HttpSession/cookie is allowed or custom state storage is required.
+4. In-memory versus Redis TTL store for OAuth handoff codes.
+5. Email canonicalization and password bounds.
+6. Product ID/decimal validation details.
+7. Rate limiting scope and logout revocation policy.

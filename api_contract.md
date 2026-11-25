@@ -1,25 +1,24 @@
-# API Contract — CSRF_JWT_OAuth Shop
+# API Contract — JWT OAuth Mock Shop
 
-## 1. Purpose and scope
+## 1. Purpose and conventions
 
-This document defines the version 1 HTTP API for the mock shop and its authentication learning flows. It follows the current `PRD.md`, `README.md`, and `use_case.md`.
-
-The backend has no database. Demo accounts are held in memory and reset when the backend restarts. The product catalog is fixed mock data. Product add/hide endpoints validate the request and return an acknowledgement; they do not persist product changes. The frontend persists accepted additions and hidden IDs in `localStorage`.
-
-## 2. Conventions
+This contract defines the Spring Boot API for the mock shop. The backend has no database: demo accounts are in memory and fixed product catalog is mock data. Product add/hide requests are acknowledged but not persisted by the backend; frontend persists local additions and hidden IDs.
 
 - Base path: `/api/v1`
-- Request and response content type: `application/json; charset=utf-8`, except OAuth browser redirects/callbacks.
-- JSON property names: `camelCase`.
-- Dates/times: ISO 8601 UTC strings when present.
-- IDs: opaque strings; clients must not infer meaning from them.
-- No pagination is defined for the fixed mock catalog. Do not return empty pagination metadata.
-- All API JSON responses use the envelope in section 3.
-- OAuth authorization and callback routes are Spring Security browser routes, not JSON API endpoints, and are listed separately.
+- JSON content type: `application/json; charset=utf-8`; OAuth routes are redirects/callbacks and not JSON APIs.
+- JSON keys use `camelCase`; dates use ISO 8601 UTC.
+- Every JSON API response uses the envelope in section 2.
+- JWT authentication uses signed compact JWS, with three Base64URL-encoded parts: `header.payload.signature`. Payload is not encrypted.
+- Protected endpoints require `Authorization: Bearer <JWT>`, except signup/signin and OAuth handoff exchange.
+- No CSRF token, CSRF header, authentication cookie, or session login is used.
+- The signing algorithm, issuer, audience, expiry, and key rotation policy must be selected during implementation. Reject unsigned or unsupported algorithms.
+- Store signing keys in local environment configuration and a secret manager/KMS in deployed environments; never in Git or Redis.
+- Local single-instance handoff state can use in-memory TTL storage. Redis is optional for shared handoff state across multiple instances; set TTL and atomically consume one-time codes.
+- The catalog is small and fixed: no pagination fields.
 
-## 3. Standard response envelope
+## 2. Standard JSON envelope
 
-Every JSON API success or error response uses this shape:
+Success and error JSON responses use:
 
 ```json
 {
@@ -29,29 +28,9 @@ Every JSON API success or error response uses this shape:
 }
 ```
 
-### Fields
+`code`, `message`, and `data` are required. Use stable application codes; clients must not parse `message`. Keep it compact: no duplicate `success`/HTTP status, empty metadata, or pagination fields.
 
-| Field | Required | Meaning |
-|---|---:|---|
-| `code` | Yes | Stable application code. Clients should branch on this field or the HTTP status, not parse `message`. |
-| `message` | Yes | Short, safe, human-readable summary. |
-| `data` | Yes | Operation result. Use an object, array, or `null` where appropriate. |
-
-Keep the envelope compact. Do not include `success`, duplicate HTTP status fields, empty `meta`, pagination fields, or echoed request headers. HTTP status is authoritative for transport-level success/failure. An optional `requestId` may be added later if observability requires it; it is omitted by default to avoid response overhead.
-
-### Success example
-
-```json
-{
-  "code": "OK",
-  "message": "Products loaded.",
-  "data": {
-    "products": []
-  }
-}
-```
-
-### Validation error example
+Validation error:
 
 ```json
 {
@@ -65,95 +44,41 @@ Keep the envelope compact. Do not include `success`, duplicate HTTP status field
 }
 ```
 
-For an error with no additional details, set `data` to `null`. Error messages must not disclose whether an account exists or expose secrets, tokens, stack traces, or provider responses.
+If there are no details, `data` is `null`. Never expose passwords, hashes, signing material, provider raw errors, or token values in errors.
 
-## 4. HTTP status and application codes
+## 3. Status codes
 
-| HTTP status | Example application code | Use |
+| HTTP | Code examples | Meaning |
 |---:|---|---|
-| `200 OK` | `OK` | Successful read or operation with a response body. |
-| `201 Created` | `CREATED` | Successful local sign-up or accepted product creation. It means the demo operation succeeded; product creation is still only persisted by the frontend. |
-| `204 No Content` | Not used for JSON API responses | Avoid because every API response uses the envelope. Use `200` with `data: null` for successful logout/hide acknowledgement. |
-| `400 Bad Request` | `VALIDATION_ERROR`, `BAD_REQUEST` | Invalid body, malformed ID, or invalid fields. |
-| `401 Unauthorized` | `UNAUTHENTICATED`, `INVALID_CREDENTIALS`, `INVALID_TOKEN` | Missing/invalid authentication or sign-in failure. Sign-in errors use a generic message. |
-| `403 Forbidden` | `FORBIDDEN` | Authenticated user lacks permission. |
-| `404 Not Found` | `NOT_FOUND` | Unknown endpoint/resource where applicable. Product IDs are demo/client-owned; backend may return accepted acknowledgement without checking catalog membership, as it does not own persistent product state. |
-| `409 Conflict` | `EMAIL_ALREADY_REGISTERED` | Duplicate email during in-memory sign-up. |
-| `415 Unsupported Media Type` | `UNSUPPORTED_MEDIA_TYPE` | Unsupported request content type. |
-| `500 Internal Server Error` | `INTERNAL_ERROR` | Unexpected server error with a generic message. |
+| 200 | `OK` | Successful read or action with body. |
+| 201 | `CREATED` | Signup or accepted mock product add. |
+| 400 | `VALIDATION_ERROR`, `BAD_REQUEST` | Malformed/invalid input. |
+| 401 | `UNAUTHENTICATED`, `INVALID_CREDENTIALS`, `INVALID_TOKEN` | Missing/invalid credentials. |
+| 403 | `FORBIDDEN` | Authenticated but disallowed, if applicable. |
+| 404 | `NOT_FOUND` | Unknown route/resource. |
+| 409 | `EMAIL_ALREADY_REGISTERED` | Duplicate in-memory account. |
+| 415 | `UNSUPPORTED_MEDIA_TYPE` | Unsupported content type. |
+| 500 | `INTERNAL_ERROR` | Generic unexpected server error. |
 
-The HTTP status and envelope `code` must agree. Do not return HTTP `200` for authentication or validation failures.
+HTTP status and envelope code must agree. Do not return 200 for errors. JSON APIs return an envelope rather than 204.
 
-## 5. Authentication and CSRF headers
+## 4. JWT bearer contract
 
-### JWT authentication
-
-The backend issues the application JWT after sign-in. The client keeps it in memory and explicitly sends it on protected requests:
+After authentication, the backend issues a signed JWT. The frontend keeps it in memory and sends:
 
 ```http
 Authorization: Bearer <jwt>
 ```
 
-This project does not use session cookies. Do not store the JWT in a cookie, `localStorage`, or `sessionStorage`. `HttpOnly` is a cookie attribute and does not apply to this bearer-header design.
+The JWT is not stored in a cookie, `localStorage`, or `sessionStorage`. A JWS signature provides integrity/authenticity, not confidentiality; claims are readable. Do not include secrets in payload. Validate signature, allowed algorithm, expiration, issuer/audience, subject, and required claims. No CSRF token is used in this project.
 
-### CSRF token policy
+## 5. Endpoints
 
-The project intentionally requires both credentials on authenticated state-changing API requests (`POST`, `PUT`, `PATCH`, and `DELETE`):
-
-```http
-Authorization: Bearer <jwt>
-X-CSRF-TOKEN: <csrf-token>
-```
-
-The backend must validate the JWT and validate that the CSRF token belongs to the authenticated login context (for example, bind it to JWT `jti` and expiry, or keep a short-lived in-memory association). Do not accept any arbitrary non-empty header as a valid CSRF token.
-
-Because the JWT is explicitly attached by JavaScript and is not an automatically sent cookie, this additional CSRF header is not needed to mitigate classic cookie-based CSRF. It is a deliberate extra request-validation rule for this learning project. Explain that distinction in the UI and docs.
-
-Sign-up/sign-in happen before an authenticated JWT exists, so they cannot require one. They require the pre-authentication CSRF token where specified below. OAuth callback routes validate OAuth `state` and follow the provider flow.
-
-The CSRF token is returned in JSON and kept in client memory; JSON values cannot have the `HttpOnly` attribute. OAuth `state`, the CSRF token, application JWT, and provider access token are distinct values.
-
-### Ephemeral security-state storage guidance
-
-- For the initial single-instance local project, an in-memory store with explicit TTL and cleanup is sufficient for pre-auth/authenticated CSRF associations and one-time OAuth handoff codes.
-- If the app later runs on multiple instances or must survive process restarts, Redis is a suitable ephemeral store for these short-lived records. Store hashes of opaque CSRF/handoff values where practical, set TTLs, namespace keys, protect Redis with network isolation/authentication/TLS as appropriate, and atomically consume one-time handoff codes (for example, `GETDEL` or a transaction/script).
-- Align authenticated CSRF-record TTL with the associated JWT expiry and invalidate/expire both consistently.
-- Do not store the JWT signing secret/private key in Redis. Use environment configuration for local development and a dedicated secret manager or KMS for deployed environments; rotate keys through an explicit key-version policy.
-- Redis is not the user's product database in this project; product records remain browser-local mock state.
-
-## 6. Endpoint contracts
-
-### 6.1 Obtain a CSRF token
-
-`POST /api/v1/csrf-token`
-
-Returns an educational CSRF token for display/header demonstration. No session is initialized and no cookie is set. The endpoint should return a stable token for the current demo flow rather than rotating it on every retry.
-
-Request body: none. The endpoint issues a short-lived pre-authentication token for sign-up/sign-in.
-
-Response: `200 OK`
-
-```json
-{
-  "code": "OK",
-  "message": "CSRF token issued.",
-  "data": {
-    "token": "<csrf-token>",
-    "headerName": "X-CSRF-TOKEN",
-    "expiresAt": "2026-11-24T12:00:00Z"
-  }
-}
-```
-
-The UI may show the token in local development for learning purposes. Never log it. This token is separate from OAuth `state`, JWT, and provider access tokens.
-
-### 6.2 Sign up
+### 5.1 Sign up
 
 `POST /api/v1/auth/signup`
 
-Creates an in-memory demo account. Accounts are lost when the backend restarts. Passwords must be hashed with Spring Security `BCryptPasswordEncoder`, even for this learning project. BCrypt is one-way hashing; the server verifies a candidate password with the encoder and never decrypts the stored hash.
-
-Request headers: `X-CSRF-TOKEN: <pre-auth-token>` (no JWT exists yet).
+No JWT required. Creates an in-memory demo account that is lost on backend restart. Password uses Spring Security `BCryptPasswordEncoder`.
 
 Request:
 
@@ -179,15 +104,13 @@ Success: `201 Created`
 }
 ```
 
-Errors: `400 VALIDATION_ERROR`, `409 EMAIL_ALREADY_REGISTERED`.
+Errors: 400 `VALIDATION_ERROR`, 409 `EMAIL_ALREADY_REGISTERED`. Never return raw password/hash or retain raw password after request processing.
 
-### 6.3 Sign in
+### 5.2 Sign in
 
 `POST /api/v1/auth/signin`
 
-Request header: `X-CSRF-TOKEN: <pre-auth-token>` (no JWT exists before sign-in).
-
-Request:
+No JWT required. Request:
 
 ```json
 {
@@ -196,20 +119,16 @@ Request:
 }
 ```
 
-Authentication is JWT-only; no `mode` field is accepted.
-
-Success in JWT mode: `200 OK`
+Success: `200 OK`
 
 ```json
 {
   "code": "OK",
   "message": "Signed in.",
   "data": {
-    "accessToken": "<application-jwt>",
+    "accessToken": "<signed-application-jwt>",
     "tokenType": "Bearer",
-    "csrfToken": "<csrf-token-bound-to-this-login>",
-    "csrfHeaderName": "X-CSRF-TOKEN",
-    "expiresAt": "2026-11-24T12:00:00Z",
+    "expiresAt": "2026-11-25T12:00:00Z",
     "user": {
       "id": "usr_demo_01",
       "email": "learner@example.test",
@@ -220,38 +139,26 @@ Success in JWT mode: `200 OK`
 }
 ```
 
-The client keeps `accessToken` in memory only. The JSON envelope returns the user summary. No session cookie is set.
+Client holds `accessToken` in memory. Errors: 400 validation, 401 generic `INVALID_CREDENTIALS`. Never return password or hash. No cookie is set.
 
-Errors: `400 VALIDATION_ERROR`, `401 INVALID_CREDENTIALS` with a generic message. Never return the password or password hash. Store only the BCrypt hash in the in-memory account record; never retain the raw password after request processing.
+### 5.3 OAuth start and callback
 
-### 6.4 OAuth login and one-time token handoff
+OAuth browser routes are not JSON envelope endpoints:
 
-OAuth browser routes do not use the JSON envelope:
+- Google: `GET /oauth2/authorization/google`; callback `GET /login/oauth2/code/google`
+- Facebook: `GET /oauth2/authorization/facebook`; callback `GET /login/oauth2/code/facebook`
 
-- Google start: `GET /oauth2/authorization/google`
-- Google callback: `GET /login/oauth2/code/google`
-- Facebook start: `GET /oauth2/authorization/facebook`
-- Facebook callback: `GET /login/oauth2/code/facebook`
+The backend validates OAuth `state`, exchanges the provider authorization code server-to-server, and resolves the application user. Provider authorization code is never sent to frontend. Backend creates a random, short-lived, single-use application handoff code and redirects to an allowlisted frontend callback carrying only that code, never the app JWT.
 
-The provider's authorization code is returned to the backend callback and exchanged server-to-server. It is never sent to the frontend. After validating OAuth `state`, provider identity, and account policy, the backend creates a random, short-lived, single-use **application handoff code** associated with the authenticated principal/provider. The callback redirects to a fixed allowlisted frontend callback URL carrying only this handoff code, never the JWT or CSRF token.
+For popup UX, callback page sends the handoff code to opener with `postMessage` using exact configured origin; opener validates `event.origin` and `event.source`, then calls exchange. Same-tab callback may exchange directly. Use `Cache-Control: no-store`, restrictive `Referrer-Policy`, no third-party resources, and remove the code from browser history as soon as practical.
 
-For popup UX, the frontend callback page sends the handoff code to its opener using `postMessage` with an exact configured origin, then closes. The opener submits the code to the exchange endpoint. For same-tab UX, the callback page submits the code directly. The callback page must use `Cache-Control: no-store`, a restrictive `Referrer-Policy`, no third-party resources, and remove the code from browser history as soon as practical.
+Spring Security's default OAuth authorization request repository uses `HttpSession`; decide whether an OAuth-only transient session is allowed or configure a secure alternative preserving state/browser binding. Do not disable OAuth state validation.
 
-Spring Security validates OAuth `state`. Its default authorization-request repository stores the authorization request in `HttpSession`; confirm whether a transient OAuth-only session cookie is permitted. If the requirement is no cookies at all, configure a secure alternative that preserves one-time state and browser binding. Do not disable state validation to avoid a cookie.
-
-#### 6.4.1 Exchange OAuth handoff code
+### 5.4 Exchange OAuth handoff code
 
 `POST /api/v1/auth/oauth/exchange`
 
-Authentication: no JWT yet. Requires the pre-auth CSRF header and a valid handoff code.
-
-Request header:
-
-```http
-X-CSRF-TOKEN: <pre-auth-csrf-token>
-```
-
-Request body:
+No app JWT yet. Request:
 
 ```json
 {
@@ -259,7 +166,7 @@ Request body:
 }
 ```
 
-The code must be high entropy, short-lived, bound to the completed OAuth transaction/provider identity, and atomically consumed once. Expired, replayed, malformed, or mismatched codes must fail without issuing credentials.
+Code must be high entropy, expire quickly, be tied to the completed provider transaction/user, and be atomically consumed once. Expired, replayed, mismatched, or malformed codes fail without issuing a JWT.
 
 Success: `200 OK`
 
@@ -268,11 +175,9 @@ Success: `200 OK`
   "code": "OK",
   "message": "OAuth sign-in completed.",
   "data": {
-    "accessToken": "<application-jwt>",
+    "accessToken": "<signed-application-jwt>",
     "tokenType": "Bearer",
-    "csrfToken": "<csrf-token-bound-to-this-login>",
-    "csrfHeaderName": "X-CSRF-TOKEN",
-    "expiresAt": "2026-11-24T12:00:00Z",
+    "expiresAt": "2026-11-25T12:00:00Z",
     "user": {
       "id": "usr_demo_oauth_01",
       "email": "learner@example.test",
@@ -283,9 +188,9 @@ Success: `200 OK`
 }
 ```
 
-The frontend keeps JWT and CSRF in memory. Errors use the standard envelope: `400 BAD_REQUEST` for malformed/expired/replayed handoff code, `403 CSRF_INVALID` for missing/invalid pre-auth CSRF, and `401 UNAUTHENTICATED` where the exchange credential is invalid. Do not reveal whether a particular code was valid beyond the agreed generic error policy.
+Errors: 400 `BAD_REQUEST` for invalid/expired/replayed code; 401 `UNAUTHENTICATED` for invalid exchange credential, using a generic policy that does not disclose code validity.
 
-### 6.5 Homepage
+### 5.5 Homepage
 
 `GET /api/v1/homepage`
 
@@ -309,9 +214,9 @@ Success: `200 OK`
 }
 ```
 
-Errors: `401 UNAUTHENTICATED`, `403 FORBIDDEN`.
+Errors: 401 invalid/missing JWT; 403 only if authorization policy requires it.
 
-### 6.6 List mock products
+### 5.6 List mock products
 
 `GET /api/v1/products`
 
@@ -338,13 +243,13 @@ Success: `200 OK`
 }
 ```
 
-The catalog is fixed and small; there are no `page`, `size`, `totalElements`, or `links` fields. The client merges this list with local additions and filters locally hidden IDs.
+Fixed, small catalog; no `page`, `size`, `totalElements`, or pagination links. Client merges local additions and filters hidden IDs.
 
-### 6.7 Add a mock product
+### 5.7 Add mock product
 
 `POST /api/v1/products`
 
-Authentication: bearer JWT plus `X-CSRF-TOKEN`.
+Authentication: bearer JWT.
 
 Request:
 
@@ -359,38 +264,15 @@ Request:
 }
 ```
 
-The client creates an opaque ID. The backend validates the fields and authentication, then acknowledges the operation without saving the product.
+Backend validates JWT/body and acknowledges; it does not save product. Success: `201 Created`, envelope contains accepted product. Frontend stores it in `localStorage` only after success.
 
-Success: `201 Created`
+Errors: 400 `VALIDATION_ERROR`, 401 `UNAUTHENTICATED`, 403 `FORBIDDEN` if applicable.
 
-```json
-{
-  "code": "CREATED",
-  "message": "Product accepted for the local demo.",
-  "data": {
-    "product": {
-      "id": "prd_local_a1b2",
-      "name": "Ceramic Mug",
-      "description": "A mock product added in the shop UI.",
-      "price": 9.5,
-      "currency": "USD",
-      "imageUrl": null
-    }
-  }
-}
-```
-
-Only after success does the frontend save the returned product in `localStorage`. Errors: `400 VALIDATION_ERROR`, `401 UNAUTHENTICATED`, `403 FORBIDDEN` or `CSRF_INVALID`.
-
-### 6.8 Hide a mock product
+### 5.8 Hide mock product
 
 `DELETE /api/v1/products/{productId}`
 
-Authentication: bearer JWT plus `X-CSRF-TOKEN`.
-
-No request body.
-
-The backend validates the request and acknowledges the demo operation; it does not delete a server-side record.
+Authentication: bearer JWT. No body. Backend acknowledges but does not delete server-side record.
 
 Success: `200 OK`
 
@@ -405,40 +287,21 @@ Success: `200 OK`
 }
 ```
 
-Only after success does the frontend add `productId` to its local hidden-ID list and filter the product out. Errors: `400 BAD_REQUEST` for malformed IDs, `401 UNAUTHENTICATED`, `403 FORBIDDEN` or `CSRF_INVALID`.
+After success frontend stores ID in local hidden list and filters it out. Errors: 400 malformed ID, 401 missing/invalid JWT, 403 if applicable.
 
-### 6.9 Inspect authenticated context
+### 5.9 Inspect authentication context
 
 `GET /api/v1/auth/sessions`
 
-Authentication: bearer JWT only. This is a read-only endpoint; CSRF header is not required.
+Authentication: bearer JWT. Read-only; no mutation.
 
-Success: `200 OK`
+Success: envelope with safe user summary, `authMode: "JWT"`, and expiry. Never include JWT, password/hash, provider access token, signing material, or session ID.
 
-```json
-{
-  "code": "OK",
-  "message": "Authentication context loaded.",
-  "data": {
-    "user": {
-      "id": "usr_demo_01",
-      "email": "learner@example.test",
-      "loginMethod": "PASSWORD",
-      "provider": null
-    },
-    "authMode": "JWT",
-    "expiresAt": "2026-11-24T12:00:00Z"
-  }
-}
-```
-
-Do not include the JWT, CSRF token, password, or provider access token in this response.
-
-### 6.10 Logout
+### 5.10 Logout
 
 `DELETE /api/v1/auth/sessions`
 
-Authentication: bearer JWT plus `X-CSRF-TOKEN`.
+Authentication: bearer JWT.
 
 Success: `200 OK`
 
@@ -450,65 +313,24 @@ Success: `200 OK`
 }
 ```
 
-Clear the client-held JWT. Unless a revocation list is implemented, an issued stateless JWT may remain valid until expiration; the response must not imply server-side revocation when none exists. Product `localStorage` is not cleared by logout.
+Frontend clears its in-memory JWT. Unless server-side revocation is implemented, a stateless JWT may remain valid until expiry; do not imply that this endpoint revokes it. Product localStorage is not cleared by logout.
 
-## 7. Common error responses
+## 6. Common errors
 
-### CSRF rejected
-
-HTTP `403 Forbidden`
+Unauthenticated (`401`):
 
 ```json
-{
-  "code": "CSRF_INVALID",
-  "message": "The CSRF token is missing, invalid, or not associated with this login.",
-  "data": null
-}
+{"code":"UNAUTHENTICATED","message":"Authentication is required.","data":null}
 ```
 
-### Unauthenticated
-
-HTTP `401 Unauthorized`
+Invalid fields (`400`):
 
 ```json
-{
-  "code": "UNAUTHENTICATED",
-  "message": "Authentication is required.",
-  "data": null
-}
+{"code":"VALIDATION_ERROR","message":"The request contains invalid fields.","data":{"fieldErrors":{"price":"Must be zero or greater."}}}
 ```
 
-### Invalid fields
+## 7. Data rules
 
-HTTP `400 Bad Request`
+Product: opaque ID; name 1–100 chars; description optional up to 500 chars; finite non-negative price; 3-letter uppercase currency; `imageUrl` absolute safe URL or `null`.
 
-```json
-{
-  "code": "VALIDATION_ERROR",
-  "message": "The request contains invalid fields.",
-  "data": {
-    "fieldErrors": {
-      "price": "Must be zero or greater."
-    }
-  }
-}
-```
-
-## 8. Product and auth data rules
-
-### Product
-
-- `id`: required opaque client-generated string for local additions; fixed IDs for seed products.
-- `name`: required, 1–100 characters.
-- `description`: optional, maximum 500 characters.
-- `price`: required finite number, greater than or equal to zero; no currency conversion.
-- `currency`: required 3-letter uppercase code; initial demo uses `USD` consistently.
-- `imageUrl`: optional absolute URL or `null`; UI may use a local placeholder.
-
-### User summary
-
-Only expose `id`, `email`, `loginMethod`, and `provider` when available. Never expose password hashes, raw OAuth claims beyond the allowed profile fields, provider access tokens, or signing material. Use `BCryptPasswordEncoder.matches(rawPassword, storedHash)` for verification; never compare raw passwords to stored hashes.
-
-## 9. Request Inspector behavior
-
-The UI may show method, path, relevant headers, status, and response envelope for learning. Mask credentials by default; provide a clearly labeled local-only reveal if token visualization is part of the UI requirement. Never log tokens to the backend. Product body/response should show the mock fields only.
+User summary exposes only ID, email, login method, provider. Never expose password/hash, raw provider claims beyond allowed profile fields, provider access token, or signing key.
