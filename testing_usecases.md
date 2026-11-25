@@ -4,13 +4,15 @@
 
 This plan derives from `PRD.md`, `README.md`, `use_case.md`, and `api_contract.md`. It is a test specification, not evidence that code has been implemented or run.
 
-- Auth uses signed compact JWS bearer tokens only. A JWT has exactly three Base64URL-encoded segments: `header.payload.signature`; it is not encrypted.
-- Protected endpoints require `Authorization: Bearer <JWT>`.
-- No CSRF token, CSRF header, authentication cookie, or session login is part of this project.
+- Protected business APIs use a signed compact JWS access JWT with exactly three Base64URL-encoded segments, a 10-minute lifetime, and JavaScript-memory-only client storage; it is not encrypted.
+- Protected business endpoints require `Authorization: Bearer <access-JWT>`.
+- Refresh uses a high-entropy opaque unpadded-Base64URL token with a 7-day lifetime in an `HttpOnly; Secure; SameSite=Lax` cookie. Redis stores only SHA-256 hashes, expiry, and session/token-family state; SHA-256 is one-way hashing, not encryption.
+- Refresh rotation is atomic and single-use; reuse of an already consumed token revokes its family/session. Only refresh/logout require signed, session-bound Double Submit Cookie CSRF validation: frontend copies the `XSRF-TOKEN` cookie into `X-CSRF-TOKEN`; business APIs do not require CSRF tokens.
+- Sign-up, sign-in, OAuth exchange, and refresh do not require a current access JWT.
 - Sign-up, sign-in, and OAuth handoff exchange are pre-authentication endpoints and cannot require the app JWT they create.
 - OAuth provider authorization code is exchanged backend-to-provider. Frontend receives only a short-lived, one-time app handoff code, then exchanges it for the app JWT.
-- No database: demo accounts are in memory and reset on backend restart; catalog is fixed mock data; product mutations are acknowledged but not persisted on backend.
-- Frontend stores accepted added products and hidden IDs in `localStorage`; JWT stays in memory only.
+- No relational database: a singleton backend in-memory user store (for example, `ConcurrentHashMap`) holds accounts across requests within one Spring Boot process, then resets on restart; separate backend instances do not share accounts. It stores account ID, normalized email, BCrypt password hash, and OAuth provider identity mapping, never raw passwords. Redis holds only refresh-token hashes and session state. Catalog is fixed mock data; product mutations are acknowledged but not persisted on backend.
+- Frontend stores accepted product additions and hidden IDs in `localStorage`; account data is backend-only, access JWT stays in memory, and 7-day refresh token is held only in the HttpOnly cookie; the `XSRF-TOKEN` cookie is intentionally readable by frontend JavaScript.
 - JSON APIs use `{ "code", "message", "data" }`; OAuth redirects/callbacks are the documented exception.
 - No pagination metadata for the fixed catalog.
 
@@ -20,6 +22,7 @@ This plan derives from `PRD.md`, `README.md`, `use_case.md`, and `api_contract.m
 - Unknown email and second account for negative/cross-account tests.
 - Valid, expired, malformed, wrong-signature, wrong-issuer, wrong-audience, and unsupported-algorithm JWT fixtures.
 - Valid, expired, replayed, malformed, and wrong-provider OAuth handoff codes.
+- Valid, expired, consumed/replayed, revoked, and unknown refresh-token records; Redis unavailable/evicted state.
 - Valid product with ID, name, description, finite price, uppercase currency, and nullable image URL.
 
 Use non-production credentials and tokens only. Do not print credentials or tokens in CI logs.
@@ -108,13 +111,17 @@ Modify subject, email, provider, or role claims and re-sign with an invalid key.
 
 Test immediately before/at/after `exp`, plus small configured clock skew. Expired JWT is rejected consistently.
 
-### TC-JWT-011 — Client does not persist JWT
+### TC-JWT-011 — Client token storage
 
-Inspect cookies, localStorage, sessionStorage, IndexedDB, URLs, and logs after sign-in. JWT exists only in memory and transient request Authorization header.
+Access JWT exists only in JavaScript memory and transient Authorization headers; refresh token is set only in an HttpOnly, Secure, SameSite=Lax cookie with a 7-day lifetime; it is absent from JSON, localStorage, sessionStorage, IndexedDB, URLs, and logs.
 
-### TC-JWT-012 — Reload/logout lifecycle
+### TC-JWT-012 — Reload and refresh lifecycle
 
-Reload clears in-memory JWT and requires sign-in. Logout clears client token. If server revocation is absent, copied JWT may remain valid until expiry; ensure product/UI does not claim revocation.
+Reload clears in-memory access JWT. A valid 7-day refresh cookie obtains a new access JWT and rotates the refresh cookie; each newly issued refresh token gets a fresh 7-day lifetime; invalid/revoked refresh state requires sign-in.
+
+### TC-JWT-013 — Logout lifecycle
+
+Logout revokes the refresh-token family/session and clears refresh and CSRF cookies. Previously issued access JWT may remain valid for up to 10 minutes from issuance; verify UI does not claim immediate access-token revocation.
 
 ## 5. UC-01 — Sign up
 
@@ -148,6 +155,10 @@ Submit simultaneous same-email registrations. At most one succeeds; others recei
 
 Create account, verify sign-in, restart backend, then verify account no longer exists as documented.
 
+### TC-SIGNUP-009 — Process-local account scope
+
+Create an account through one backend instance. A subsequent request to that same instance can sign in; a separate independent instance has no copy of the account. Do not describe the in-memory store as shared or durable.
+
 ### TC-SIGNUP-008 — No auth credential required
 
 Sign-up succeeds without Authorization because this endpoint creates the account before authentication.
@@ -158,7 +169,7 @@ Endpoint: `POST /api/v1/auth/signin`; no JWT required.
 
 ### TC-SIGNIN-001 — Valid credentials
 
-Correct credentials return 200 envelope with token type `Bearer`, expiry, signed compact JWS, and safe user summary.
+Correct credentials return 200 envelope with 10-minute access token type `Bearer`, expiry, signed compact JWS, safe user summary, and a 7-day refresh-token cookie.
 
 ### TC-SIGNIN-002 — Unknown email/wrong password
 
@@ -172,9 +183,9 @@ Missing/null email/password, invalid email, wrong JSON types, and malformed JSON
 
 Valid login succeeds without Authorization header. Sign-in cannot require the JWT it is about to issue.
 
-### TC-SIGNIN-005 — No cookie
+### TC-SIGNIN-005 — Refresh cookie issued
 
-Inspect response headers; no auth/session/JWT cookie is set.
+Inspect response headers: refresh token is set only as HttpOnly, Secure, SameSite=Lax cookie with a 7-day expiry; it is not returned in JSON. Access JWT is not placed in a cookie.
 
 ### TC-SIGNIN-006 — JWS claims
 
@@ -340,17 +351,49 @@ Repeated or concurrent DELETE is handled consistently; hidden ID is stored once 
 
 Network error, timeout, 4xx/5xx, or malformed envelope does not hide locally before success.
 
-## 12. UC-09 — Logout
+## 12. UC-10 — Refresh-token rotation
 
-Endpoint: `DELETE /api/v1/auth/sessions`; JWT required.
+Endpoint: `POST /api/v1/auth/refresh`; no access JWT required. Refresh cookie and CSRF/origin proof required.
+
+### TC-REFRESH-001 — Valid refresh rotates once
+
+A valid current token returns a new 10-minute access JWT and sets a new opaque refresh cookie with a fresh 7-day lifetime. Redis contains the SHA-256 hash of the new token and records the old token as consumed; raw token is never stored.
+
+### TC-REFRESH-002 — Old-token replay revokes family
+
+After successful rotation from R1 to R2, presenting R1 again is detected as reuse. Backend revokes the complete token family/session and all refresh attempts in that family fail; no tokens are issued.
+
+### TC-REFRESH-003 — Invalid/expired/revoked token
+
+Unknown, malformed, expired, consumed, or revoked refresh token returns 401 with no access token or replacement cookie.
+
+### TC-REFRESH-004 — Atomic rotation and concurrency
+
+Concurrent refresh requests using the same token cannot both succeed. Client serializes refresh calls; server uses an atomic Redis operation/transaction and produces at most one replacement.
+
+### TC-REFRESH-005 — Redis failure/eviction
+
+If Redis is unavailable or required token state is missing, refresh fails closed and does not issue credentials. Verify key TTL does not exceed the session/token expiry.
+
+### TC-REFRESH-006 — Double Submit Cookie scope and validation
+
+Refresh and logout require the server-issued `XSRF-TOKEN` cookie plus matching `X-CSRF-TOKEN` header; reject missing, mismatched, invalidly signed, or wrong-session tokens. Business endpoints with Bearer JWT do not require CSRF token. Verify refresh/logout also enforce the configured origin/CORS policy.
+
+### TC-REFRESH-007 — Token secrecy and hashing
+
+Redis stores only SHA-256 token hashes and minimal session metadata. Raw refresh tokens do not appear in responses except the Set-Cookie value, application logs, traces, or error messages.
+
+## 13. UC-09 — Logout
+
+Endpoint: `DELETE /api/v1/auth/sessions`; refresh cookie and CSRF/origin proof required; access JWT is optional.
 
 ### TC-LOGOUT-001 — Valid logout
 
-Returns 200 envelope; frontend clears in-memory JWT and navigates to sign-in. Product localStorage remains.
+Returns 200 envelope; backend revokes the current refresh-token family/session in Redis and clears refresh and CSRF cookies. Frontend clears in-memory access JWT and navigates to sign-in. Product localStorage remains.
 
-### TC-LOGOUT-002 — Missing/invalid JWT
+### TC-LOGOUT-002 — Missing/invalid refresh credential
 
-Returns 401; UI does not claim successful server revocation.
+Returns 401 for missing/invalid refresh cookie and 403 for missing/invalid CSRF proof; UI reports logout only according to the API result.
 
 ### TC-LOGOUT-003 — Repeated logout
 
@@ -358,52 +401,58 @@ Repeated logout after client clears token is handled gracefully and consistently
 
 ### TC-LOGOUT-004 — Old JWT after logout
 
-If no revocation list exists, copied JWT may remain valid until expiry. Verify actual policy and do not claim otherwise.
+After logout, refresh attempts fail because the session is revoked. A copied access JWT may remain valid for up to 10 minutes from issuance; verify it is rejected after expiry.
 
-## 13. Client token lifecycle and transport edge cases
+## 14. Client token lifecycle and transport edge cases
 
-### TC-CLIENT-001 — Memory-only JWT
+### TC-CLIENT-001 — Access JWT memory-only
 
-JWT absent from cookies, localStorage, sessionStorage, IndexedDB, URL, and persistent logs.
+Access JWT is absent from cookies, localStorage, sessionStorage, IndexedDB, URL, and persistent logs.
 
-### TC-CLIENT-002 — Reload
+### TC-CLIENT-002 — Refresh cookie transport
 
-Reload loses in-memory JWT and requires sign-in; local product state remains.
+Refresh token is inaccessible to JavaScript, scoped to auth routes, sent only to the expected API origin, and absent from browser storage/URLs/logs. The refresh cookie is `HttpOnly; Secure; SameSite=Lax` with a 7-day expiry; the CSRF cookie is JavaScript-readable and session-bound.
 
-### TC-CLIENT-003 — Sign-out cleanup
+### TC-CLIENT-003 — Reload and refresh
+
+Reload loses the in-memory access JWT; a valid 7-day refresh cookie obtains a new pair and rotates; each newly issued refresh token receives a fresh 7-day lifetime. Invalid/revoked cookie state requires sign-in; local product state remains.
+
+### TC-CLIENT-004 — Sign-out cleanup
 
 No stale Authorization header is sent after logout; token references removed from app state/interceptors.
 
-### TC-CLIENT-004 — Token sent only to API origin
+### TC-CLIENT-005 — Token sent only to API origin
 
 Never attach Authorization to image, analytics, provider, or arbitrary cross-origin URLs.
 
-### TC-CLIENT-005 — Multiple tabs
+### TC-CLIENT-006 — Multiple tabs
 
 Tokens remain tab-local; product localStorage is shared browser state and must not be described as user-owned server data.
 
-### TC-CLIENT-006 — CORS/preflight
+### TC-CLIENT-007 — CORS/preflight
 
 Disallowed origins cannot call protected endpoints; approved origin allows only required methods/headers. No arbitrary origin reflection.
 
-### TC-CLIENT-007 — Request size/abuse
+### TC-CLIENT-008 — Request size/abuse
 
 Huge JWT/header/body and high-rate invalid requests are rejected with bounded resource use. Consider rate limiting signup, signin, OAuth start, exchange, and product writes.
 
-### TC-CLIENT-008 — Filter-chain error mapping
+### TC-CLIENT-009 — Filter-chain error mapping
 
 Security-filter failures use the standard API envelope; no framework HTML or stack trace on API routes.
 
-## 14. Acceptance checklist
+## 15. Acceptance checklist
 
-- Local signup/signin returns a valid signed three-segment JWS and validates claims/signature.
-- No CSRF token endpoint, header, cookie, or validation rule remains.
-- Protected API requests require bearer JWT; sign-up/sign-in/OAuth exchange are documented pre-auth exceptions.
+- Local signup/signin and OAuth exchange return a valid 10-minute signed three-segment JWS access token, validate its claims/signature, and set a 7-day refresh cookie.
+- Refresh token is opaque Base64URL; Redis stores only its SHA-256 hash and TTL-bound session state. Rotation is atomic and reuse revokes the family.
+- Logout revokes refresh state; access JWT remains valid no longer than 10 minutes from issuance.
+- Only cookie-authenticated refresh/logout routes enforce signed, session-bound Double Submit Cookie using the `XSRF-TOKEN` cookie and matching `X-CSRF-TOKEN` header.
+- Protected business API requests require bearer access JWT; sign-up/sign-in/OAuth exchange/refresh are documented pre-access-token exceptions.
 - OAuth state and one-time handoff exchange are covered; JWT never enters redirect URLs.
 - Product operations update localStorage only after backend acknowledgement and do not imply server persistence.
-- Account reset, fixed catalog, logout limitations, and response envelope match docs.
+- Account reset, fixed catalog, refresh/logout behavior, and response envelope match docs.
 
-## 15. Open decisions affecting tests
+## 16. Open decisions affecting tests
 
 1. Signing algorithm, issuer, audience, expiry, and key rotation policy.
 2. OAuth popup versus same-tab UX.
@@ -411,4 +460,5 @@ Security-filter failures use the standard API envelope; no framework HTML or sta
 4. In-memory versus Redis TTL store for OAuth handoff codes.
 5. Email canonicalization and password bounds.
 6. Product ID/decimal validation details.
-7. Rate limiting scope and logout revocation policy.
+7. Whether the refresh-token family also has an absolute maximum lifetime, and how long consumed-token markers are retained.
+8. Rate limiting scope and cookie domain/path/CORS credential settings for deployment.
