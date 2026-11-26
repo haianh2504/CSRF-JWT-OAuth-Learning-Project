@@ -1,8 +1,37 @@
-# CSRF_JWT_OAuth
+<h1 align="center">CSRF · JWT · OAuth Mock Shop</h1>
 
-A Spring Boot learning project with a mock shop UI. Users sign up/sign in with email/password or Google/Facebook OAuth, then browse mock products, add products, and hide products while learning signed JWT (JWS) access-token authentication with opaque refresh-token rotation and revocation.
+<p align="center">
+  A learning project for secure authentication, OAuth login, and a small mock shop.
+</p>
 
-There is no relational database in the initial learning version. Run one Spring Boot backend instance; demo accounts live in its memory. One local Redis instance stores refresh-token hashes, session state, account lock state, CSRF token hashes, OAuth state/handoff hashes, and session denylist entries keyed by `sid`. Redis is not shared across multiple backend instances. The backend validates requests and returns mock responses. The frontend persists accepted product additions and hidden product IDs in `localStorage`.
+<p align="center">
+  <a href="https://www.typescriptlang.org/"><img alt="TypeScript 5.9 — frontend" src="https://img.shields.io/badge/TypeScript_5.9-frontend-3178C6?style=for-the-badge&logo=typescript&logoColor=white"></a>
+  <a href="https://nextjs.org/"><img alt="Next.js 16" src="https://img.shields.io/badge/Next.js_16-000000?style=for-the-badge&logo=nextdotjs&logoColor=white"></a>
+  <a href="https://react.dev/"><img alt="React 19" src="https://img.shields.io/badge/React_19-20232A?style=for-the-badge&logo=react&logoColor=61DAFB"></a>
+</p>
+
+<p align="center">
+  <a href="https://www.java.com/"><img alt="Java 21 — planned backend" src="https://img.shields.io/badge/Java_21-planned_backend-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white"></a>
+  <a href="https://spring.io/projects/spring-boot"><img alt="Spring Boot — planned backend" src="https://img.shields.io/badge/Spring_Boot-planned_backend-6DB33F?style=for-the-badge&logo=springboot&logoColor=white"></a>
+  <a href="https://spring.io/projects/spring-security"><img alt="Spring Security — planned backend" src="https://img.shields.io/badge/Spring_Security-planned_backend-6DB33F?style=for-the-badge&logo=springsecurity&logoColor=white"></a>
+  <img alt="Spring OAuth2 Client — planned backend" src="https://img.shields.io/badge/Spring_OAuth2_Client-planned_backend-6DB33F?style=for-the-badge&logo=springsecurity&logoColor=white">
+  <img alt="Maven — planned backend build" src="https://img.shields.io/badge/Maven-planned_backend_build-C71A36?style=for-the-badge&logo=apachemaven&logoColor=white">
+  <a href="https://redis.io/"><img alt="Redis" src="https://img.shields.io/badge/Redis-planned_session_store-DC382D?style=for-the-badge&logo=redis&logoColor=white"></a>
+</p>
+
+<p align="center">
+  <img alt="Google OAuth 2.0" src="https://img.shields.io/badge/Google_OAuth_2.0-4285F4?style=for-the-badge&logo=google&logoColor=white">
+  <img alt="Facebook OAuth 2.0" src="https://img.shields.io/badge/Facebook_OAuth_2.0-0866FF?style=for-the-badge&logo=facebook&logoColor=white">
+  <img alt="JWT HS256" src="https://img.shields.io/badge/JWT-HS256-000000?style=for-the-badge&logo=jsonwebtokens&logoColor=white">
+</p>
+
+<p align="center"><sub>Frontend: present in this repository · Java/Spring/Redis backend: documented target, implementation not yet included</sub></p>
+
+## Project overview
+
+This repository contains a Next.js mock-shop frontend and the specifications for its planned Spring Boot authentication backend. The designed user flows cover email/password sign-in, Google/Facebook OAuth, JWT access tokens, opaque refresh-token rotation, and mock product actions.
+
+The planned initial backend has no relational database: demo accounts are held in process memory, and one local Redis instance stores refresh-token hashes, session state, account-lock state, CSRF hashes, OAuth state/handoff hashes, and session deny-list entries keyed by `sid`. Redis is not shared across multiple backend instances. The frontend persists accepted product additions and hidden product IDs in `localStorage`.
 
 ## Scope
 
@@ -67,19 +96,23 @@ OAuth uses a popup. Backend generates separate 32-byte `SecureRandom` state and 
 | `DELETE` | `/api/v1/products/{productId}` | Validate/acknowledge product hide; frontend persists locally. |
 | `DELETE` | `/api/v1/auth/sessions` | Require access JWT and CSRF; revoke its session family, deny-list `sid`, and clear cookies. |
 
-## Planned technology
+## Technology stack and implementation status
 
-Java 21 (confirm when scaffolding), Spring Boot, Spring Security, Spring Security OAuth2 Client, Maven, and Redis for refresh/session revocation state. Demo accounts are in memory and reset on backend restart; there is no relational database initially.
+| Area | Technologies | Status in this repository |
+|---|---|---|
+| Frontend | TypeScript 5.9, Next.js 16, React 19 | Present under [`frontend/`](frontend/). |
+| Backend target | Java 21, Spring Boot, Spring Security, Spring Security OAuth2 Client, Maven | Defined by the project documents; backend source/scaffold is not included yet. |
+| Session and revocation store | Redis | Planned for refresh-token rotation, OAuth state/handoff, CSRF hashes, and session deny-list state. |
+| Login providers | Google OAuth 2.0, Facebook OAuth 2.0 | Designed as backend-mediated OAuth login with a popup handoff. |
+| App authentication | JWT/JWS with HS256; opaque rotating refresh tokens | Design documented in this repository. |
+
+The initial backend design uses an in-memory demo-account store and one local Redis instance; there is no relational database in scope.
 
 ## Run locally
 
-To be completed after creating source code. Expected command:
+The checked-in runnable app is the frontend. Follow [`frontend/README.md`](frontend/README.md) to install and start it. The Spring Boot backend is specified but has no source or Maven wrapper in this repository yet, so API-backed sign-in and OAuth flows require that backend to be implemented and running at the documented local origin.
 
-```bash
-./mvnw spring-boot:run
-```
-
-OAuth requires Google/Facebook client credentials. Use environment configuration or ignored local config; never commit secrets.
+When implementing OAuth, configure Google/Facebook client credentials through environment or ignored local configuration; never commit secrets.
 
 ## Security notes
 
