@@ -37,6 +37,8 @@ button:disabled{cursor:not-allowed;opacity:.58;transform:none!important}.auth-ch
   transition:color var(--motion-fast) ease-out,background-color var(--motion-fast) ease-out,border-color var(--motion-fast) ease-out,box-shadow var(--motion-fast) ease-out,transform var(--motion-fast) ease-out,opacity var(--motion-fast) ease-out;
 }
 .mode-button.active{transition:color var(--motion-standard) ease-out,background-color var(--motion-standard) ease-out,box-shadow var(--motion-standard) ease-out}
+.mode-copy{display:inline-block;opacity:0;transform:translateY(3px);transition:opacity 110ms var(--ease-exit),transform 110ms var(--ease-exit)}
+.mode-copy.is-visible{opacity:1;transform:translateY(0);transition-duration:160ms;transition-timing-function:var(--ease-enter)}
 .auth-card{animation:auth-card-enter var(--motion-emphasis) var(--ease-enter) both}
 .auth-heading,.auth-caption,.form-error,.shop-state{animation:content-enter var(--motion-standard) var(--ease-enter) both}
 .product-card{animation:product-enter var(--motion-standard) var(--ease-enter) both;transition:transform var(--motion-fast) ease-out,box-shadow var(--motion-fast) ease-out}
@@ -53,5 +55,5 @@ button:disabled{cursor:not-allowed;opacity:.58;transform:none!important}.auth-ch
 @keyframes product-enter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 @media(prefers-reduced-motion:reduce){
   .auth-card,.auth-heading,.auth-caption,.form-error,.shop-state,.product-card{animation:none!important}
-  .primary-button,.secondary-button,.oauth-button,.mode-button,.demo-link,.hide-button,.close-button,.product-card,.modal-backdrop,.modal,.toast{transition:none!important}
+  .primary-button,.secondary-button,.oauth-button,.mode-button,.mode-copy,.demo-link,.hide-button,.close-button,.product-card,.modal-backdrop,.modal,.toast{transition:none!important}
 }

@@ -1,4 +1,4 @@
-import type { FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { AuthMode } from "./auth-lab-types";
 
 type AuthScreenProps = {
@@ -38,8 +38,12 @@ export function AuthScreen({
           <div className="learning-chips"><span className="learning-chip"><b>01</b> Sign in</span><span className="learning-chip"><b>02</b> JWT bearer</span><span className="learning-chip"><b>03</b> Refresh safely</span></div>
         </section>
         <section className="auth-card" aria-label="Khu vực đăng nhập">
-          <h2 className="auth-heading" key={`${mode}-heading`}>{mode === "signin" ? "Chào bạn, bắt đầu nhé" : "Tạo tài khoản"}</h2>
-          <p className="auth-caption" key={`${mode}-caption`}>{mode === "signin" ? "Đăng nhập để mở không gian thực hành của bạn." : "Tạo tài khoản để thực hành luồng đăng ký."}</p>
+          <h2 className="auth-heading" aria-label={mode === "signin" ? "Chào bạn, bắt đầu nhé" : "Tạo tài khoản"}>
+            <ModeText mode={mode} signin="Chào bạn, bắt đầu nhé" signup="Tạo tài khoản" />
+          </h2>
+          <p className="auth-caption" aria-label={mode === "signin" ? "Đăng nhập để mở không gian thực hành của bạn." : "Tạo tài khoản để thực hành luồng đăng ký."}>
+            <ModeText mode={mode} signin="Đăng nhập để mở không gian thực hành của bạn." signup="Tạo tài khoản để thực hành luồng đăng ký." />
+          </p>
           <div className="mode-switch" role="tablist" aria-label="Chọn hình thức">
             <button type="button" role="tab" aria-selected={mode === "signin"} className={`mode-button ${mode === "signin" ? "active" : ""}`} onClick={() => onModeChange("signin")}>Đăng nhập</button>
             <button type="button" role="tab" aria-selected={mode === "signup"} className={`mode-button ${mode === "signup" ? "active" : ""}`} onClick={() => onModeChange("signup")}>Tạo tài khoản</button>
@@ -49,8 +53,8 @@ export function AuthScreen({
             <div className="field"><label htmlFor="password">Mật khẩu</label><input id="password" name="password" type="password" autoComplete={mode === "signup" ? "new-password" : "current-password"} placeholder="Nhập mật khẩu" required disabled={isSubmitting || isLoadingShop} /></div>
             {error && <p className="form-error" role="alert">{error}</p>}
             {canRetryShop && <button type="button" className="secondary-button retry-shop" onClick={onRetryShop}>Thử tải không gian học tập lần nữa</button>}
-            <button className="primary-button full" type="submit" disabled={isSubmitting || isLoadingShop}>
-              {isLoadingShop ? "Đang mở không gian…" : isSubmitting ? "Đang xử lý…" : mode === "signin" ? "Đăng nhập" : "Tạo tài khoản"}
+            <button className="primary-button full" type="submit" disabled={isSubmitting || isLoadingShop} aria-label={isLoadingShop ? "Đang mở không gian…" : isSubmitting ? "Đang xử lý…" : mode === "signin" ? "Đăng nhập" : "Tạo tài khoản"}>
+              {isLoadingShop ? "Đang mở không gian…" : isSubmitting ? "Đang xử lý…" : <ModeText mode={mode} signin="Đăng nhập" signup="Tạo tài khoản" />}
               {!isSubmitting && !isLoadingShop && <span aria-hidden="true">→</span>}
             </button>
           </form>
@@ -66,4 +70,46 @@ export function AuthScreen({
       <p className="footer-note">Tài khoản và giao dịch ở đây phục vụ mục đích học tập.</p>
     </main>
   );
+}
+
+function ModeText({ mode, signin, signup }: { mode: AuthMode; signin: string; signup: string }) {
+  const [displayedMode, setDisplayedMode] = useState(mode);
+  const [isVisible, setIsVisible] = useState(true);
+  const displayedModeRef = useRef(mode);
+
+  useEffect(() => {
+    let swapTimer = 0;
+    let enterFrame = 0;
+    let revealFrame = 0;
+    let exitFrame = 0;
+
+    if (displayedModeRef.current === mode) {
+      enterFrame = window.requestAnimationFrame(() => setIsVisible(true));
+    } else {
+      exitFrame = window.requestAnimationFrame(() => {
+        setIsVisible(false);
+        const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        swapTimer = window.setTimeout(() => {
+          displayedModeRef.current = mode;
+          setDisplayedMode(mode);
+          if (prefersReducedMotion) {
+            setIsVisible(true);
+          } else {
+            enterFrame = window.requestAnimationFrame(() => {
+              revealFrame = window.requestAnimationFrame(() => setIsVisible(true));
+            });
+          }
+        }, prefersReducedMotion ? 0 : 110);
+      });
+    }
+
+    return () => {
+      window.cancelAnimationFrame(exitFrame);
+      window.cancelAnimationFrame(enterFrame);
+      window.cancelAnimationFrame(revealFrame);
+      if (swapTimer) window.clearTimeout(swapTimer);
+    };
+  }, [mode]);
+
+  return <span className={`mode-copy ${isVisible ? "is-visible" : ""}`}>{displayedMode === "signin" ? signin : signup}</span>;
 }

@@ -67,7 +67,7 @@ export function AddProductDialog({ open, demoMode, error, isSubmitting, onClose,
   open: boolean; demoMode: boolean; error: string; isSubmitting: boolean;
   onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
-  const [isPresent, setIsPresent] = useState(open);
+  const [isPresent, setIsPresent] = useState(false);
   const [isVisible, setIsVisible] = useState(false);
   const dialogRef = useRef<HTMLElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
@@ -75,17 +75,13 @@ export function AddProductDialog({ open, demoMode, error, isSubmitting, onClose,
   useEffect(() => {
     let frame = 0;
     let exitTimer = 0;
-    if (open) {
-      if (!isPresent && document.activeElement instanceof HTMLElement) {
-        returnFocusRef.current = document.activeElement;
-      }
-      setIsPresent(true);
-      frame = window.requestAnimationFrame(() => {
-        setIsVisible(true);
-        dialogRef.current?.querySelector<HTMLInputElement>("input")?.focus();
-      });
-    } else if (isPresent) {
-      setIsVisible(false);
+    if (open && !isPresent) {
+      if (document.activeElement instanceof HTMLElement) returnFocusRef.current = document.activeElement;
+      frame = window.requestAnimationFrame(() => setIsPresent(true));
+    } else if (open && isPresent && !isVisible) {
+      frame = window.requestAnimationFrame(() => setIsVisible(true));
+    } else if (!open && isPresent) {
+      if (isVisible) frame = window.requestAnimationFrame(() => setIsVisible(false));
       const exitDelay = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 220;
       exitTimer = window.setTimeout(() => {
         setIsPresent(false);
@@ -97,7 +93,13 @@ export function AddProductDialog({ open, demoMode, error, isSubmitting, onClose,
       if (frame) window.cancelAnimationFrame(frame);
       if (exitTimer) window.clearTimeout(exitTimer);
     };
-  }, [isPresent, open]);
+  }, [isPresent, isVisible, open]);
+
+  useEffect(() => {
+    if (open && isPresent && isVisible) {
+      dialogRef.current?.querySelector<HTMLInputElement>("input")?.focus();
+    }
+  }, [isPresent, isVisible, open]);
 
   if (!isPresent) return null;
   return <div className={`modal-backdrop ${isVisible ? "is-visible" : "is-closing"}`} role="presentation" onMouseDown={(event) => { if (isVisible && event.target === event.currentTarget && !isSubmitting) onClose(); }}>

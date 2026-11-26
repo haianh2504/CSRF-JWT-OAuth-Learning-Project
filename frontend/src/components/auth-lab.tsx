@@ -429,10 +429,12 @@ function ToastMessage({ message }: { message: string }) {
     let frame = 0;
     let exitTimer = 0;
     if (message) {
-      setDisplayMessage(message);
-      frame = window.requestAnimationFrame(() => setIsVisible(true));
+      frame = window.requestAnimationFrame(() => {
+        setDisplayMessage(message);
+        setIsVisible(true);
+      });
     } else {
-      setIsVisible(false);
+      frame = window.requestAnimationFrame(() => setIsVisible(false));
       const exitDelay = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 220;
       exitTimer = window.setTimeout(() => setDisplayMessage(""), exitDelay);
     }
