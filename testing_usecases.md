@@ -8,12 +8,12 @@ This plan derives from `PRD.md`, `README.md`, `use_case.md`, and `api_contract.m
 - Access JWTs use only HS256 (HMAC-SHA-256) and a 32-byte secret provisioned once with a cryptographically secure random generator; the same configured key is used across logins and restarts, with no signing-key rotation in this project. Only refresh tokens rotate. The key is never hardcoded, sent to the frontend, placed in a JWT, or stored in Redis.
 - Each access JWT requires `iss`, `sub`, `aud`, `exp`, `iat`, `jti` (fresh UUID v4 per access token), `sid` (UUID v4 created once per successful login and unchanged across refresh), and `token-type: access`; never reuse `jti` or `sid`. The issuer must never emit a `role` claim, and the validator rejects any access JWT containing `role`, even when signed with the correct test/server key.
 - Protected business endpoints require `Authorization: Bearer <access-JWT>`.
-- Refresh uses a high-entropy opaque unpadded-Base64URL token with a 7-day lifetime in an `HttpOnly; Secure; SameSite=Lax` cookie. Redis maps SHA-256 refresh-token hashes to `sid`, stores session/family state and latest access-token `exp`, account-lock state and active-session indexes, plus a session denylist keyed by `sid` through the latest `exp`; SHA-256 is one-way hashing, not encryption. Never store complete JWTs or signing keys in Redis.
-- Refresh rotation is atomic and single-use; reuse of an already consumed token revokes its family/session. Refresh and logout require a session-bound CSRF token generated with `SecureRandom`; Redis stores its SHA-256 hash by `sid`, the frontend copies `XSRF-TOKEN` into `X-CSRF-TOKEN`, and the backend checks cookie/header equality and the session hash. The CSRF token is not signed. Logout additionally requires an access JWT. Business APIs require Bearer JWT; after signature, claims, and expiry validation, they check its `sid` against the local Redis denylist. They do not require CSRF tokens.
+- Refresh uses a high-entropy opaque unpadded-Base64URL token with up to 7 days idle lifetime in an `HttpOnly; SameSite=Lax` cookie; `Secure` is off only for local HTTP and on for HTTPS. The refresh-token family expires 15 days after login, and refresh cannot extend it. Redis maps SHA-256 refresh-token hashes to `sid`, stores absolute session expiry and latest access-token `exp`, account-lock state and active-session indexes, plus a session denylist keyed by `sid` through latest `exp`; SHA-256 is one-way hashing, not encryption. Retain consumed-token hashes until their original expiry (maximum 7 days), bounded by family expiry. Never store complete JWTs or signing keys in Redis.
+- Refresh rotation is atomic and single-use; replay of a consumed token before its original expiry revokes the family/session. After original expiry, replay is rejected as 401 but does not revoke an otherwise-live family. Refresh and logout require a session-bound CSRF token generated with `SecureRandom`; Redis stores its SHA-256 hash by `sid`, the frontend copies `XSRF-TOKEN` into `X-CSRF-TOKEN`, and the backend checks cookie/header equality and the session hash. The CSRF token is not signed. Logout additionally requires an access JWT. Business APIs require Bearer JWT; after signature, claims, expiry, and maximum session-age validation, they check session/denylist state in local Redis. They do not require CSRF tokens.
 - Sign-up, sign-in, OAuth exchange, and refresh do not require a current access JWT.
 - Sign-up, sign-in, and OAuth handoff exchange are pre-authentication endpoints and cannot require the app JWT they create.
-- OAuth provider authorization code is exchanged backend-to-provider. Frontend receives only a short-lived, one-time app handoff code, then exchanges it for the app JWT.
-- No relational database and one backend instance only: a singleton backend in-memory user store holds accounts across requests within the Spring Boot process, then resets on restart. Redis is local to this backend and is not shared across backend instances. It holds refresh-token hashes mapped to `sid`, session state, account lock state, active-session indexes, `sid` denylist entries through each session's latest access-token expiry, CSRF token hashes, OAuth state hashes, and OAuth handoff-code hashes; it does not hold complete JWTs or signing keys. Catalog is fixed mock data; product mutations are acknowledged but not persisted on backend.
+- OAuth provider authorization code is exchanged backend-to-provider. OAuth uses a popup; the popup sends only a short-lived, one-time app handoff code to its opener, which exchanges it for the app JWT. The popup never receives the app JWT.
+- No relational database and one backend instance only: a singleton backend in-memory user store holds accounts across requests within the Spring Boot process, then resets on restart. Redis is local to this backend and is not shared across backend instances. It holds refresh-token hashes mapped to `sid`, 15-day absolute session state, account lock state, active-session indexes, `sid` denylist entries through each session's latest access-token expiry, CSRF token hashes, 5-minute OAuth state hashes, and 60-second handoff-code hashes; successful state/handoff consumption atomically deletes the corresponding Redis record. It does not hold complete JWTs, signing keys, or raw OAuth state/handoff values. Catalog is fixed mock data; product mutations are acknowledged but not persisted on backend.
 - Frontend stores accepted product additions and hidden IDs in `localStorage`; account data is backend-only, access JWT stays in memory, and 7-day refresh token is held only in the HttpOnly cookie; the `XSRF-TOKEN` cookie is intentionally readable by frontend JavaScript.
 - JSON APIs use `{ "code", "message", "data" }`; OAuth redirects/callbacks are the documented exception.
 - No pagination metadata for the fixed catalog.
@@ -23,7 +23,7 @@ This plan derives from `PRD.md`, `README.md`, `use_case.md`, and `api_contract.m
 - New account `learner@example.test` with a known test password.
 - Unknown email and second account for negative/cross-account tests.
 - Valid, expired, malformed, wrong-signature, wrong-issuer, wrong-audience, and unsupported-algorithm JWT fixtures.
-- Valid, expired, replayed, malformed, and wrong-provider OAuth handoff codes.
+- OAuth fixtures: valid, missing, malformed, expired, replayed, cross-browser, and wrong-provider state; valid, expired, replayed, altered, and unknown handoff code; provider denial, 5xx, timeout, and Redis failure.
 - Valid, expired, consumed/replayed, revoked, and unknown refresh-token records; Redis unavailable/evicted state. Include multiple access JWTs sharing one `sid`, active/deny-listed/expired/unknown `sid` values, TTL boundaries, and Redis outage for denylist reads/writes.
 - Valid product with ID, name, description, finite price, uppercase currency, and nullable image URL.
 - Multiple sessions for the same account, with distinct `sid` values and separate CSRF/refresh state.
@@ -117,11 +117,11 @@ Test immediately before/at/after `exp`, plus small configured clock skew. Expire
 
 ### TC-JWT-011 — Client token storage
 
-Access JWT exists only in JavaScript memory and transient Authorization headers; refresh token is set only in an HttpOnly, Secure, SameSite=Lax cookie with a 7-day lifetime; it is absent from JSON, localStorage, sessionStorage, IndexedDB, URLs, and logs.
+Access JWT exists only in JavaScript memory and transient Authorization headers; refresh token is set only in an HttpOnly SameSite=Lax cookie with `Secure=false` only for local HTTP and `Secure=true` for HTTPS, with expiry `min(now + 7 days, session absolute expiry)`; it is absent from JSON, localStorage, sessionStorage, IndexedDB, URLs, and logs.
 
 ### TC-JWT-012 — Reload and refresh lifecycle
 
-Reload clears in-memory access JWT. A valid 7-day refresh cookie obtains a new access JWT with a fresh `jti` but the same `sid`, and rotates the refresh cookie; each new refresh token gets a fresh 7-day lifetime. Invalid/revoked refresh state requires sign-in.
+Reload clears in-memory access JWT. A valid refresh cookie obtains a new access JWT with a fresh `jti` but same `sid`, and rotates the refresh cookie; each new refresh token gets up to 7 days idle lifetime, capped by the 15-day family expiry. At the family expiry, restore returns HTTP 401 and requires sign-in.
 
 ### TC-JWT-013 — Logout lifecycle
 
@@ -197,7 +197,7 @@ Valid login succeeds without Authorization header. Sign-in cannot require the JW
 
 ### TC-SIGNIN-005 — Refresh cookie issued
 
-Inspect response headers: refresh token is set only as HttpOnly, Secure, SameSite=Lax cookie with a 7-day expiry; it is not returned in JSON. Access JWT is not placed in a cookie.
+Inspect response headers: refresh token is set only as HttpOnly SameSite=Lax cookie with expiry `min(now + 7 days, session absolute expiry)`; `Secure` is disabled only for local HTTP and enabled for HTTPS. It is not returned in JSON. Access JWT is not placed in a cookie.
 
 ### TC-SIGNIN-006 — JWS claims
 
@@ -217,15 +217,19 @@ Routes: Google `GET /oauth2/authorization/google`, callback `/login/oauth2/code/
 
 ### TC-OAUTH-001 — Start provider flow
 
-Provider button opens the correct authorization route, expected client registration and minimal required scopes.
+Provider button opens a popup directly from the user gesture; disable duplicate OAuth starts while a popup is pending. Starting the flow returns HTTP 302 to the configured provider with exact registered callback, `response_type=code`, 32-byte random `state`, and PKCE S256 challenge. Verify state and browser-binding values are independent, contain no PII, are Base64URL without padding, and only their SHA-256 hashes are stored in Redis. State and browser-binding cookie expire within 5 minutes. If popup creation is blocked, retain the page and show a retryable message; make no OAuth request.
+
+If Redis is unavailable while creating state, return HTTP 503; do not redirect to the provider or set a browser-binding cookie.
+
+OAuth status matrix: provider start `302`; valid provider callback or safe provider/account error redirect `302`; invalid/missing/replayed state or missing code without a provider error `400` generic no-store page; Redis unavailable at start/callback/exchange `503`; provider rejection `502`; provider timeout `504`; server misconfiguration or unexpected internal failure `500`; successful handoff exchange `200`; missing/malformed exchange request `400`; unknown/expired/replayed/mismatched handoff `401`. OAuth redirects/callback pages are not JSON-envelope responses.
 
 ### TC-OAUTH-002 — OAuth state generated/validated
 
-State is generated with `SecureRandom`, stored as a SHA-256-keyed record with a 5-minute TTL in local Redis, bound to the initiating browser with a short-lived HttpOnly SameSite=Lax nonce cookie, validated on callback, and atomically consumed once. Missing, tampered, expired, replayed, cross-browser, and cross-provider state is rejected. Redis is local to the single backend instance, not shared across instances.
+State is 32 random bytes from `SecureRandom`, Base64URL without padding, stored by SHA-256 hash with provider, exact callback, expiry, browser-binding hash, and PKCE verifier in local Redis for 5 minutes. The separate browser-binding value is 32 random bytes in an HttpOnly SameSite=Lax cookie (`Secure` only over HTTPS); never encode user or browser data into state. A valid provider callback returns HTTP 302 to the fixed frontend popup callback after state is atomically consumed and its Redis record deleted. Missing, malformed, mismatched, expired, replayed, cross-browser, or cross-provider state returns HTTP 400 with a generic no-store page and no account/session/credential side effects. Redis outage during lookup/consume returns HTTP 503. Redis is local to the single backend instance, not shared across instances.
 
 ### TC-OAUTH-003 — Success and account mapping
 
-Successful provider auth maps by stable provider subject; provider and allowed profile claims appear in shop. No duplicate account on repeat login.
+Successful provider auth maps by `(provider, stable subject)`; provider and allowed profile claims appear in shop. An already-linked identity signs into its existing account. A new provider identity with verified email and no existing account creates an account. A missing/unverified email or verified-email collision with an existing account returns a 302 to the fixed frontend callback with a safe `oauthError` code; do not auto-link by email. No duplicate account on repeat login.
 
 ### TC-OAUTH-004 — Provider authorization code stays backend-side
 
@@ -237,35 +241,35 @@ Google/Facebook access token presented to app API is rejected unless explicitly 
 
 ### TC-OAUTH-006 — Consent denied/provider error
 
-Deny consent or simulate provider 5xx/timeout at redirect, code exchange, user-info, and app-token issuance. User remains unauthenticated; no partial account/token state.
+Deny consent with a valid state: backend consumes/deletes state and returns 302 to the fixed frontend callback with `oauthError=access_denied`, no handoff code or session. Provider rejects token/profile exchange: HTTP 502; provider timeout: HTTP 504; Redis failure: HTTP 503. For all failures, assert no partial account/session/token state, no refresh/CSRF cookies, and a generic safe UI error.
 
 ### TC-OAUTH-007 — Invalid provider configuration
 
-Missing/wrong client ID/secret fails safely; no secret appears in error/log.
+Missing client configuration fails before redirect with HTTP 500 `INTERNAL_ERROR`; invalid provider credentials fail at provider exchange with HTTP 502. No client secret appears in error, redirect, or log.
 
 ### TC-OAUTH-008 — Missing/unverified email
 
-No email, unverified email, changed email, or mismatched identity follows explicit linking policy. Never merge accounts solely by unverified email.
+No email or unverified email returns 302 to the fixed frontend callback with a safe `oauthError=profile_not_eligible`. A verified provider email matching an existing local account returns 302 with `oauthError=account_link_required`; do not auto-link. A changed email still resolves an already-linked `(provider, stable subject)` to the same account. Assert no duplicate or merged account and no session/cookies on these rejected cases.
 
 ### TC-OAUTH-009 — OAuth provider mix-up
 
-Send Google response to Facebook callback and vice versa; validate issuer, registration, client ID, and provider identity; reject mismatch.
+Send Google response to Facebook callback and vice versa; validate issuer, registration, client ID, state provider, PKCE transaction, and provider identity. Reject with HTTP 400, no redirect to an untrusted location, and no account/session/cookies.
 
 ### TC-OAUTH-010 — Redirect allowlist
 
-Malicious `returnUrl`, absolute URL, protocol-relative URL, encoded external URL, and Host-header manipulation cannot cause open redirect.
+Successful start and callback redirects return HTTP 302 only to the registered provider or exact configured frontend callback. Malicious `returnUrl`, absolute URL, protocol-relative URL, encoded external URL, and Host-header manipulation cannot change the target. Untrusted target attempts return HTTP 400 and create no session/code.
 
 ### TC-OAUTH-011 — Token leakage
 
-JWT/provider token never appears in callback URL, query, fragment, logs, analytics, or referrer. Callback page uses no-store/no-referrer, no third-party assets, and removes handoff code from history promptly.
+App JWT and provider tokens never appear in callback URL, query, fragment, logs, analytics, referrer, or `postMessage`. Only the short-lived app handoff code appears as `?handoff=` in the frontend popup callback URL; the provider's `?code=` remains backend-only. Callback uses no-store/no-referrer and no third-party assets; copy `handoff` to memory and remove it from popup history before `postMessage`. The opener accepts `{ type: "OAUTH_HANDOFF", code }` only from the exact frontend origin and the popup window it opened.
 
 ### TC-OAUTH-012 — Redis-backed OAuth state storage
 
-The flow uses the local Redis state record and browser-binding nonce cookie described in the API contract; do not use Spring Security's default HttpSession authorization request repository. Verify cookies and browser binding are correct. Do not disable state validation.
+The flow uses the local Redis state record and browser-binding cookie described in the API contract; do not use Spring Security's default HttpSession authorization request repository. Verify state, cookie binding, PKCE S256 verifier, exact callback, and record deletion after valid consumption. A Redis outage returns HTTP 503; no OAuth account, handoff code, access token, or auth cookie is created. Do not disable state validation.
 
 ### TC-OAUTH-013 — Callback side effects and state-cookie cleanup
 
-Missing, mismatched, expired, replayed, or cross-browser state must not create/link an account, create a login session, issue a handoff code, or set access/refresh credentials. A valid state is consumed once; verify that a stale browser-binding cookie cannot make consumed/expired state valid again and that cookie cleanup obeys its documented TTL.
+Missing, malformed, mismatched, expired, replayed, or cross-browser state returns HTTP 400; valid state with Redis unavailable returns HTTP 503. No failure creates/links an account, creates a session, issues a handoff code, or sets auth cookies. A valid state is atomically consumed and deleted exactly once. Clear the browser-binding cookie using the same path/domain attributes after a completed callback; an expired Redis record is removed by TTL.
 
 ## 8. UC-05 — OAuth handoff exchange
 
@@ -273,31 +277,31 @@ Endpoint: `POST /api/v1/auth/oauth/exchange`; no JWT yet.
 
 ### TC-HANDOFF-001 — Valid code exchange
 
-Valid code returns 200 JSON envelope with app JWS and safe user summary, creates a new `sid`, stores session/CSRF state, and sets refresh and CSRF cookies. Code is consumed exactly once and is absent from JSON response except as the submitted request value.
+Valid handoff code returns HTTP 200 JSON envelope with app JWS and safe user summary, creates a new `sid` with 15-day absolute expiry, stores session/CSRF state, and sets refresh and CSRF cookies. In the same atomic Redis operation, successfully consume and delete the handoff record. The code is absent from response JSON except as the submitted request value.
 
 ### TC-HANDOFF-002 — Expired/replayed/malformed code
 
-Expired, already-used, random, altered, truncated, malformed, wrong-provider, or wrong-transaction code fails without issuing JWT.
+Missing code, non-string/empty `code`, or malformed JSON/request shape returns HTTP 400 `VALIDATION_ERROR`. Expired, already-used, random, altered, truncated, wrong-length, wrong-transaction, or unknown non-empty string code returns HTTP 401 `UNAUTHENTICATED` with the same generic response. None issues JWT or sets/rotates cookies. Do not distinguish expired, replayed, or unknown code in message/body.
 
 ### TC-HANDOFF-003 — Concurrent redemption
 
-Redeem same code from two concurrent requests/workers; at most one receives credentials.
+Redeem the same code concurrently: exactly one request returns HTTP 200 and creates a session; the other returns HTTP 401 `UNAUTHENTICATED`. Redis has no remaining code record after the successful exchange; no second session/cookie pair is issued.
 
 ### TC-HANDOFF-004 — Popup postMessage
 
-Callback posts code only to exact configured origin. Opener validates `event.origin`, `event.source`, and payload shape; unexpected origin/source is ignored.
+Popup callback copies `handoff` to memory, removes that query parameter from its URL, then posts only the handoff code to the exact configured frontend origin. Opener validates `event.origin`, `event.source`, request state, and payload shape; unexpected origin/source is ignored and causes no exchange request. Popup closes only after opener acknowledgement.
 
-### TC-HANDOFF-005 — Same-tab flow
+### TC-HANDOFF-005 — Popup handoff and URL cleanup
 
-The selected same-tab callback removes the handoff code from the address bar/history before exchange. Reload/back cannot expose or redeem the same code again; failure displays a recoverable sign-in error without putting the code back in the URL.
+The selected popup callback removes the handoff code from address bar/history before `postMessage`; the opener exchanges it once. Reload/back cannot expose or redeem the code a second time. If exchange returns 401, show a safe recoverable error and restart OAuth. If the code was consumed but the response was lost, restart OAuth; never assume login succeeded.
 
 ### TC-HANDOFF-006 — Handoff store expiry/failure
 
-Handoff code is generated with `SecureRandom`, stored by SHA-256 hash in local Redis for 60 seconds, and atomically consumed exactly once. Test TTL, concurrent redemption, Redis outage/eviction, and fail-closed behavior. Never store JWT signing key in Redis.
+Handoff code is 32 `SecureRandom` bytes encoded as unpadded Base64URL; local Redis stores only the SHA-256 hash and verified account/provider reference for 60 seconds. A successful exchange atomically consumes and deletes the record. Redis outage returns HTTP 503 `SERVICE_UNAVAILABLE`; expired/evicted/unknown records return HTTP 401; unexpected signing/session-creation failure returns HTTP 500 `INTERNAL_ERROR` without a successful auth response. Never store JWT signing key or raw code in Redis.
 
 ### TC-HANDOFF-007 — Exchange retry/network ambiguity
 
-Network failure before redemption may retry within code lifetime. If code is consumed but response lost, fail safely and restart OAuth rather than issuing duplicate credentials.
+Network failure before the exchange reaches backend may retry within the 60-second TTL. If the backend consumed/deleted the code but the response was lost, retry returns HTTP 401 and the user restarts OAuth; do not issue duplicate credentials or assume a session exists.
 
 ## 9. UC-06 — Homepage and mock catalog
 
@@ -393,15 +397,15 @@ Endpoint: `POST /api/v1/auth/refresh`; no access JWT required. Refresh cookie an
 
 ### TC-REFRESH-001 — Valid refresh rotates once
 
-A valid current token returns a new 10-minute access JWT and sets a new opaque refresh cookie with a fresh 7-day lifetime. Redis contains the SHA-256 hash of the new token and records the old token as consumed; raw token is never stored.
+A valid current token returns HTTP 200, a new access JWT expiring at `min(now + 10 minutes, session absolute expiry)`, and a new opaque refresh cookie expiring at `min(now + 7 days, session absolute expiry)`. Redis contains the new token hash and a consumed marker for the old hash through the old token's original expiry; raw token is never stored.
 
 ### TC-REFRESH-002 — Old-token replay revokes family
 
-After successful rotation from R1 to R2, presenting R1 again is detected as reuse. Backend revokes the complete token family/session and all refresh attempts in that family fail; no tokens are issued.
+After rotation from R1 to R2, presenting R1 before R1's original `exp` returns HTTP 401 and revokes the complete family/session; subsequent R2 refresh also returns HTTP 401. Redis removes the R1 consumed marker at its TTL. A replay after R1's original expiry returns HTTP 401 as expired but does not revoke a still-valid family, because R1 could no longer refresh.
 
 ### TC-REFRESH-003 — Invalid/expired/revoked token
 
-Unknown, malformed, expired, consumed, revoked, or sid-deny-listed refresh token returns 401 with no access token or replacement cookie. Refresh is checked through opaque-token/session state in Redis, not JWT signature/claims.
+Missing/malformed request shape returns HTTP 400 `VALIDATION_ERROR`; unknown, expired, consumed-before-expiry, revoked, absolute-session-expired, or sid-deny-listed refresh token returns HTTP 401 `UNAUTHENTICATED` with no access token or replacement cookie. If the consumed marker proves replay before original token expiry, revoke the family. Refresh is checked through opaque-token/session state in Redis, not JWT signature/claims.
 
 ### TC-REFRESH-004 — Atomic rotation and concurrency
 
@@ -409,11 +413,11 @@ Concurrent refresh requests using the same token cannot both succeed. Client ser
 
 ### TC-REFRESH-005 — Redis failure/eviction
 
-If Redis is unavailable or required token state is missing, refresh fails closed and does not issue credentials. Verify key TTL does not exceed the session/token expiry.
+If Redis is unavailable, refresh returns HTTP 503 `SERVICE_UNAVAILABLE`; missing/evicted required token state returns HTTP 401 `UNAUTHENTICATED`. Both fail closed and issue no credentials. Verify active and consumed-marker TTLs do not exceed their token/session expiry.
 
 ### TC-REFRESH-006 — Double Submit Cookie scope and validation
 
-Refresh and logout require the server-issued `XSRF-TOKEN` cookie plus matching `X-CSRF-TOKEN` header; reject missing, mismatched, unknown-hash, or wrong-session tokens. The token is a `SecureRandom` value stored by SHA-256 hash in Redis and is not signed. Return 403 `CSRF_INVALID` on failure. Business endpoints with Bearer JWT do not require CSRF token. Verify refresh/logout also enforce the configured origin/CORS policy.
+Refresh and logout require the server-issued `XSRF-TOKEN` cookie plus matching `X-CSRF-TOKEN` header; reject missing, mismatched, unknown-hash, or wrong-session tokens with HTTP 403 `CSRF_INVALID` before token mutation. The token is a `SecureRandom` value stored by SHA-256 hash in Redis and is not signed. Business endpoints with Bearer JWT do not require CSRF token. With the current Next.js rewrite proxy, browser calls are same-origin and CORS is not needed; if direct browser-to-backend calls are enabled, test exact-origin credentialed CORS and reject wildcard origin.
 
 ### TC-REFRESH-007 — Token secrecy and hashing
 
@@ -421,11 +425,19 @@ Redis maps SHA-256 refresh-token hashes to session `sid` and stores session meta
 
 ### TC-REFRESH-008 — CSRF rejection has no token side effects
 
-Missing, mismatched, or wrong-session CSRF proof returns 403 `CSRF_INVALID` before rotation. The current refresh token remains usable with valid CSRF proof; no replacement is issued, no token is marked consumed, and no family is revoked solely because CSRF validation failed.
+Missing, mismatched, or wrong-session CSRF proof returns HTTP 403 `CSRF_INVALID` before rotation. The current refresh token remains usable with valid CSRF proof; no replacement is issued, no token is marked consumed, and no family is revoked solely because CSRF validation failed.
 
 ### TC-REFRESH-009 — Expired access recovery retries once
 
 When a protected request returns 401 because the access JWT expired, refresh once, retry the original request once with the new JWT, and stop if the retry fails. Concurrent requests share/serialize refresh so they do not replay the same refresh token; invalid refresh or refresh 503 does not cause an infinite retry loop.
+
+### TC-REFRESH-010 — Fifteen-day absolute family expiry
+
+At login, record `sessionExpiresAt = loginTime + 15 days`. Repeated refresh near day 15 never extends that instant; each refresh cookie gets `min(now + 7 days, sessionExpiresAt)` and each access JWT gets `min(now + 10 minutes, sessionExpiresAt)`. At/after absolute expiry, refresh returns HTTP 401 `UNAUTHENTICATED`, issues no token/cookie, and protected access tokens are expired. Verify the session/refresh Redis keys do not outlive the absolute expiry.
+
+### TC-REFRESH-011 — Consumed-token replay marker lifetime
+
+For each rotated token, retain only its SHA-256 consumed marker until its original token `exp`, at most 7 days and never beyond the 15-day family expiry. Replay before original `exp` returns HTTP 401 and revokes the family; after original `exp`, it returns HTTP 401 without revoking an otherwise-active family. Two-hour marker expiry is insufficient and must not be used.
 
 ## 13. UC-09 — Logout
 
@@ -487,11 +499,11 @@ Access JWT is absent from cookies, localStorage, sessionStorage, IndexedDB, URL,
 
 ### TC-CLIENT-002 — Refresh cookie transport
 
-Refresh token is inaccessible to JavaScript, scoped to auth routes, sent only to the expected API origin, and absent from browser storage/URLs/logs. The refresh cookie is `HttpOnly; Secure; SameSite=Lax` with a 7-day expiry; the CSRF cookie is JavaScript-readable and session-bound.
+Refresh token is inaccessible to JavaScript, scoped to auth routes, sent only through the same-origin Next.js proxy, and absent from browser storage/URLs/logs. The refresh cookie is `HttpOnly; SameSite=Lax`, with `Secure` disabled only for local HTTP and enabled for HTTPS; expiry is capped by both 7 idle days and session absolute expiry. The CSRF cookie is JavaScript-readable and session-bound.
 
 ### TC-CLIENT-003 — Reload and refresh
 
-Reload loses the in-memory access JWT; a valid 7-day refresh cookie obtains a new pair and rotates; each newly issued refresh token receives a fresh 7-day lifetime. Invalid/revoked cookie state requires sign-in; local product state remains.
+Reload loses the in-memory access JWT; a valid refresh cookie obtains a new pair and rotates; each new refresh token receives up to 7 days idle lifetime, capped by the session's 15-day absolute expiry. Invalid/revoked/expired family state requires sign-in; local product state remains.
 
 ### TC-CLIENT-004 — Sign-out cleanup
 
@@ -507,7 +519,7 @@ Tokens remain tab-local; product localStorage is shared browser state and must n
 
 ### TC-CLIENT-007 — CORS/preflight
 
-Disallowed origins cannot call protected endpoints; approved origin allows only required methods/headers. No arbitrary origin reflection.
+Through the documented Next.js rewrites, browser API calls remain same-origin and do not use CORS; verify proxy forwards request cookies and preserves `Set-Cookie`. If direct browser-to-backend calls are enabled, only exact configured origins are allowed with credentials; preflight allows only required methods/headers and `Authorization`, `Content-Type`, and `X-CSRF-TOKEN`. Reject wildcard origins and arbitrary origin reflection.
 
 ### TC-CLIENT-008 — Request size/abuse
 
@@ -543,19 +555,19 @@ While adding/hiding, disable duplicate action for the relevant form/item. On API
 
 ### TC-CLIENT-016 — OAuth callback code handling
 
-On same-tab callback, remove the handoff code from the visible URL/history before making the exchange request. Exchange is attempted once; malformed/expired code shows a recoverable error without exposing code or provider details.
+On popup callback, remove the handoff code from visible URL/history before `postMessage`; opener verifies origin/source and exchanges it once. Malformed/expired code shows a recoverable error without exposing code or provider details. Close popup only after opener acknowledgement.
 
 ## 15. Acceptance checklist
 
-- Local signup/signin and OAuth exchange return a valid 10-minute signed three-segment JWS access token, validate its claims/signature, and set a 7-day refresh cookie.
-- Refresh token is opaque Base64URL; Redis stores its SHA-256 hash and TTL-bound session state. Rotation is atomic and reuse revokes the family. Redis also stores session denylist entries by `sid` through the session's latest access-token `exp`, never full JWTs.
+- Local signup/signin and OAuth exchange return a valid signed three-segment JWS access token with lifetime up to 10 minutes, validate its claims/signature, and set a refresh cookie with up to 7 days idle lifetime.
+- Refresh token is opaque Base64URL; Redis stores its SHA-256 hash and TTL-bound session state. Session family lifetime is capped at 15 days from login; refresh cannot extend it. Rotation is atomic; consumed hashes are retained until original token expiry (up to 7 days) and replay before that expiry revokes the family. Redis also stores session denylist entries by `sid` through latest access-token `exp`, never full JWTs.
 - Logout requires access JWT plus refresh cookie and CSRF; it revokes the entire refresh family and deny-lists the session `sid` through the latest access-token `exp`, rejecting all access JWTs in that session. Admin lock revokes every active session for the account the same way. Protected APIs fail closed if Redis cannot confirm denylist status.
 - Refresh and logout enforce session-bound CSRF with a `SecureRandom` token stored by hash in Redis and matched from `XSRF-TOKEN`/`X-CSRF-TOKEN`; the CSRF token is not signed. Logout also requires Bearer access JWT. Business Bearer endpoints do not require CSRF.
 - Protected business API requests require bearer access JWT; sign-up/sign-in/OAuth exchange/refresh are documented pre-access-token exceptions.
 - `GET /api/v1/auth/sessions` returns only its documented safe auth context and is covered for missing/invalid/revoked credentials.
 - Denylist lookup happens only after valid JWT signature, claims, and time checks; valid tokens fail closed with 503 if Redis cannot confirm their session status.
 - CSRF rejection does not consume/rotate refresh tokens or report logout success; a failed logout preserves client auth state for retry.
-- OAuth state and one-time handoff exchange are covered; JWT never enters redirect URLs.
+- OAuth popup flow verifies 32-byte random state, browser binding, PKCE S256, provider/error redirects, one-time handoff, exact-origin/source `postMessage`, and exact HTTP statuses. State records are deleted after valid callback consumption; handoff records are deleted after successful exchange. App JWT never enters redirect URLs or `postMessage`.
 - Product operations update localStorage only after backend acknowledgement and do not imply server persistence.
 - Malformed/unavailable localStorage does not crash the UI or cause unacknowledged product changes to appear persisted.
 - Account reset, fixed catalog, refresh/logout behavior, and response envelope match docs.
@@ -565,6 +577,5 @@ On same-tab callback, remove the handoff code from the visible URL/history befor
 1. Admin-lock API, admin authorization, account-unlock behavior, and lock-state persistence.
 2. Exact email canonicalization and password length/character bounds.
 3. Product ID/decimal constraints and response policy for well-formed but unknown product IDs.
-4. OAuth account-linking policy for missing/unverified emails or a provider identity matching an existing account.
-5. Whether the refresh-token family also has an absolute maximum lifetime, and how long consumed-token markers are retained.
-6. Rate limiting scope and cookie domain/path/CORS credential settings for deployment.
+4. Rate limiting scope.
+5. Verify production Vercel proxy forwards cookies and `Set-Cookie`; confirm production callback allowlist, cookie `Domain`/`Path`, and whether a shared custom domain or same-origin proxy will be used. Local Next.js proxy is same-origin; CORS is needed only if browser calls backend directly.
